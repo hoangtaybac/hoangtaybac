@@ -168,7 +168,9 @@ function preprocessMathMLForSqrt(mathml) {
 function postprocessLatexSqrt(latex) {
   if (!latex) return latex;
   let s = String(latex);
-  
+  // 🔥 FIX BUG: 60/0 -> 60\%
+  s = s.replace(/(\d+)\s*\/\s*0\b/g, "$1\\text{\\%}");
+
   // Some converters output \\surd instead of \\sqrt
   s = s.replace(/\\surd\b/g, '\\sqrt{}');
   
