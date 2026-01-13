@@ -460,7 +460,7 @@ function manualMathMLToLatex(mathml) {
             "σ": "\\sigma",
             "φ": "\\phi",
             "ω": "\\omega",
-            "%": "\\text{\%}",
+            "%": "\\text{%}",
           };
           result += opMap[op] || op;
           break;
