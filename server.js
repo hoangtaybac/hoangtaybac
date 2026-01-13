@@ -202,6 +202,10 @@ function postprocessLatexSqrt(latex) {
 function finalLatexCleanup(latex) {
   if (!latex) return latex;
   let s = String(latex);
+   // ✅ Ensure percent (%) is escaped for MathJax
+  // 50%  -> 50\%
+  // keep existing \% unchanged
+  s = s.replace(/(^|[^\\])%/g, "$1\\%");
   
   // Remove zero-width characters
   s = s.replace(/[\u200B-\u200D\uFEFF]/g, '');
