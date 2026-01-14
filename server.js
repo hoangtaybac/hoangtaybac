@@ -214,7 +214,7 @@ function postprocessLatexSqrt(latex) {
   });
 
   // phần còn lại: chỉ escape % chưa được escape
-  s = s.replace(/(^|[^\\%])%/g, "$1\\%");
+  s = s.replace(/(^|[^\\])%(?!\s*\})/g, "$1\\%");
 
   // dọn Unicode
   s = s.replace(/[\u200B-\u200D\uFEFF]/g, '');
