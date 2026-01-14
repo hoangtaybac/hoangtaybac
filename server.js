@@ -169,7 +169,7 @@ function postprocessLatexSqrt(latex) {
   if (!latex) return latex;
   let s = String(latex);
   // 🔥 FIX BUG: 60/0 -> 60\%
-  s = s.replace(/(\d+)\s*\/\s*0\b/g, "$1\\text{\%}");
+  
 
   // Some converters output \\surd instead of \\sqrt
   s = s.replace(/\\surd\b/g, '\\sqrt{}');
@@ -201,13 +201,24 @@ function postprocessLatexSqrt(latex) {
 /**
  * ✅ FIX: Final LaTeX cleanup - fix Unicode issues, malformed fences, spaced functions
  */
-function finalLatexCleanup(latex) {
+  function finalLatexCleanup(latex) {
   if (!latex) return latex;
   let s = String(latex);
-   // ✅ Ensure percent (%) is escaped for MathJax
-  // 50%  -> 50\%
-  // keep existing \% unchanged
-  s = s.replace(/(^|[^\\])%/g, "$1\\%");
+
+  // ✅ CHỈ escape % khi ở math mode trần, KHÔNG nằm trong \text{}
+  // 60%   → 60\%
+  // \text{60%} → \text{60\%}
+  s = s.replace(/\\text\{([^}]*)\}/g, (m, content) => {
+    const fixed = content.replace(/(^|[^\\])%/g, "$1\\%");
+    return `\\text{${fixed}}`;
+  });
+
+  // phần còn lại: chỉ escape % chưa được escape
+  s = s.replace(/(^|[^\\%])%/g, "$1\\%");
+
+  // dọn Unicode
+  s = s.replace(/[\u200B-\u200D\uFEFF]/g, '');
+  s = s.replace(/\s{2,}/g, ' ').trim();
   
   // Remove zero-width characters
   s = s.replace(/[\u200B-\u200D\uFEFF]/g, '');
