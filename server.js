@@ -384,7 +384,7 @@ function manualMathMLToLatex(mathml) {
       num.textContent.trim() === "0" &&
       den.textContent.trim() === "0"
     ) {
-      return "\\text{\\%}";
+      return "\\text{\%}";
     }
 
     return parseNode(num) + "/" + parseNode(den);
