@@ -373,24 +373,7 @@ function manualMathMLToLatex(mathml) {
             result += `\\sqrt{${nodeToLatex(content)}}`;
           }
           break;
-          
-    case "mfrac": {
-    const num = node.children[0];
-    const den = node.children[1];
-
-    // 🔥 MathType percent: mfrac bevelled="true" 0/0
-    if (
-      node.getAttribute("bevelled") === "true" &&
-      num.textContent.trim() === "0" &&
-      den.textContent.trim() === "0"
-    ) {
-      return "\\text{\\%}";
-    }
-
-    return parseNode(num) + "/" + parseNode(den);
-  }
-    break;
-          
+                
         case "msup":
           if (Array.isArray(content) && content.length >= 2) {
             const base = nodeToLatex(content[0]);
@@ -471,7 +454,7 @@ function manualMathMLToLatex(mathml) {
             "σ": "\\sigma",
             "φ": "\\phi",
             "ω": "\\omega",
-            "%": "\\text{%}",
+            "%": "\\%",
           };
           result += opMap[op] || op;
           break;
