@@ -168,9 +168,7 @@ function preprocessMathMLForSqrt(mathml) {
 function postprocessLatexSqrt(latex) {
   if (!latex) return latex;
   let s = String(latex);
-  // 🔥 FIX BUG: 60/0 -> 60\%
   
-
   // Some converters output \\surd instead of \\sqrt
   s = s.replace(/\\surd\b/g, '\\sqrt{}');
   
@@ -201,24 +199,9 @@ function postprocessLatexSqrt(latex) {
 /**
  * ✅ FIX: Final LaTeX cleanup - fix Unicode issues, malformed fences, spaced functions
  */
-  function finalLatexCleanup(latex) {
+function finalLatexCleanup(latex) {
   if (!latex) return latex;
   let s = String(latex);
-
-  // ✅ CHỈ escape % khi ở math mode trần, KHÔNG nằm trong \text{}
-  // 60%   → 60\%
-  // \text{60%} → \text{60\%}
-  s = s.replace(/\\text\{([^}]*)\}/g, (m, content) => {
-    const fixed = content.replace(/(^|[^\\])%/g, "$1\\%");
-    return `\\text{${fixed}}`;
-  });
-
-  // phần còn lại: chỉ escape % chưa được escape
-  s = s.replace(/(^|[^\\])%(?!\s*\})/g, "$1\\%");
-
-  // dọn Unicode
-  s = s.replace(/[\u200B-\u200D\uFEFF]/g, '');
-  s = s.replace(/\s{2,}/g, ' ').trim();
   
   // Remove zero-width characters
   s = s.replace(/[\u200B-\u200D\uFEFF]/g, '');
@@ -373,7 +356,17 @@ function manualMathMLToLatex(mathml) {
             result += `\\sqrt{${nodeToLatex(content)}}`;
           }
           break;
-                
+          
+        case "mfrac":
+          if (Array.isArray(content) && content.length >= 2) {
+            const num = nodeToLatex(content[0]);
+            const den = nodeToLatex(content[1]);
+            result += `\\frac{${num}}{${den}}`;
+          } else {
+            result += nodeToLatex(content);
+          }
+          break;
+          
         case "msup":
           if (Array.isArray(content) && content.length >= 2) {
             const base = nodeToLatex(content[0]);
@@ -454,7 +447,7 @@ function manualMathMLToLatex(mathml) {
             "σ": "\\sigma",
             "φ": "\\phi",
             "ω": "\\omega",
-            "%": "\\%",
+	    "%": "\\%",
           };
           result += opMap[op] || op;
           break;
