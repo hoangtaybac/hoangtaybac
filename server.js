@@ -16,6 +16,8 @@ const upload = multer({
   limits: { fileSize: 50 * 1024 * 1024 },
 });
 
+const DEBUG_MT = !!process.env.DEBUG_MT;
+
 /* ================= Helpers ================= */
 
 function parseRels(relsXml) {
@@ -69,7 +71,7 @@ async function getZipEntryBuffer(zipFiles, p) {
   return await f.buffer();
 }
 
-/* ================= Inkscape Convert EMF/WMF -> PNG ================= */
+/* ================= Inkscape Convert EMF/WMF -> PNG (unchanged) ================= */
 
 function inkscapeConvertToPng(inputPath, outputPath) {
   return new Promise((resolve, reject) => {
@@ -113,7 +115,7 @@ async function maybeConvertEmfWmfToPng(buf, filename) {
 /* ================= MathType OLE -> MathML -> LaTeX ================= */
 
 /**
- * scan MathML embedded directly in OLE (nhanh)
+ * scan MathML embedded directly in OLE quickly
  */
 function extractMathMLFromOleScan(buf) {
   const utf8 = buf.toString("utf8");
@@ -135,6 +137,7 @@ function extractMathMLFromOleScan(buf) {
 
 /**
  * fallback: call ruby mt2mml.rb ole.bin -> MathML
+ * (kept as-is - requires mt2mml.rb in PATH)
  */
 function rubyOleToMathML(oleBuf) {
   return new Promise((resolve, reject) => {
@@ -157,53 +160,75 @@ function rubyOleToMathML(oleBuf) {
   });
 }
 
+/* ------------------ New helpers to handle OMML radical variants ------------------ */
+
 /**
- * Normalize OMML radical tags to MathML equivalents.
- *
- * This is a lightweight, heuristic transform:
- * - <m:rad> ... <m:deg>index</m:deg> <m:e>base</m:e> </m:rad>  --> <mroot>base index</mroot>
- * - <m:rad> ... <m:e>base</m:e> </m:rad>  --> <msqrt>base</msqrt>
- *
- * It also attempts to handle tags without the "m:" prefix.
- *
- * Note: This is intentionally conservative — it does string-based transforms
- * to improve convertibility to MathML -> LaTeX without changing the main algorithm.
+ * Strip common OMML wrapper tags like <m:r><m:t>... to their text content
+ * Conservative: only remove wrappers expected from OMML
+ */
+function stripOmmlWrappers(s) {
+  if (!s) return s;
+  return s
+    .replace(/<m:r\b[^>]*>/gi, "")
+    .replace(/<\/m:r>/gi, "")
+    .replace(/<m:t\b[^>]*>/gi, "")
+    .replace(/<\/m:t>/gi, "")
+    .replace(/<r\b[^>]*>/gi, "")
+    .replace(/<\/r>/gi, "")
+    .replace(/<t\b[^>]*>/gi, "")
+    .replace(/<\/t>/gi, "");
+}
+
+/**
+ * Heuristic normalization: convert OMML-style radical nodes to MathML equivalents.
+ * - handle <m:rad> / <rad> variants (with nested <m:e>, <m:deg>, or wrappers)
+ * - produce <msqrt> or <mroot> to help MathML->LaTeX convertor
  */
 function normalizeRadicalsInMathML(mml) {
   if (!mml || typeof mml !== "string") return mml;
-
   let s = mml;
 
-  // Handle <m:rad> ... </m:rad>
+  // normalize newlines to spaces for our regex-based transforms
+  s = s.replace(/\r?\n/g, " ");
+
+  // PASS 1: <m:rad> ... </m:rad>
   s = s.replace(/<m:rad\b[^>]*>([\s\S]*?)<\/m:rad>/gi, (full, inner) => {
-    // try to extract <m:e> and optional <m:deg>
-    const eMatch = inner.match(/<m:e\b[^>]*>([\s\S]*?)<\/m:e>/i);
     const degMatch = inner.match(/<m:deg\b[^>]*>([\s\S]*?)<\/m:deg>/i);
-    const e = eMatch ? eMatch[1] : "";
-    const deg = degMatch ? degMatch[1] : "";
-
-    if (deg && deg.trim()) {
-      return `<mroot>${e}${deg}</mroot>`;
-    }
-    return `<msqrt>${e}</msqrt>`;
+    const eMatch = inner.match(/<m:e\b[^>]*>([\s\S]*?)<\/m:e>/i);
+    const deg = degMatch ? stripOmmlWrappers(degMatch[1]).trim() : "";
+    const e = eMatch ? stripOmmlWrappers(eMatch[1]).trim() : "";
+    if (e && deg) return `<mroot>${e}${deg}</mroot>`;
+    if (e) return `<msqrt>${e}</msqrt>`;
+    const fallback = stripOmmlWrappers(inner).trim();
+    if (fallback) return `<msqrt>${fallback}</msqrt>`;
+    return full;
   });
 
-  // Handle <rad> ... </rad> (without prefix)
+  // PASS 2: <rad> ... </rad> (no prefix)
   s = s.replace(/<rad\b[^>]*>([\s\S]*?)<\/rad>/gi, (full, inner) => {
-    const eMatch = inner.match(/<e\b[^>]*>([\s\S]*?)<\/e>/i);
     const degMatch = inner.match(/<deg\b[^>]*>([\s\S]*?)<\/deg>/i);
-    const e = eMatch ? eMatch[1] : "";
-    const deg = degMatch ? degMatch[1] : "";
-
-    if (deg && deg.trim()) {
-      return `<mroot>${e}${deg}</mroot>`;
-    }
-    return `<msqrt>${e}</msqrt>`;
+    const eMatch = inner.match(/<e\b[^>]*>([\s\S]*?)<\/e>/i);
+    const deg = degMatch ? stripOmmlWrappers(degMatch[1]).trim() : "";
+    const e = eMatch ? stripOmmlWrappers(eMatch[1]).trim() : "";
+    if (e && deg) return `<mroot>${e}${deg}</mroot>`;
+    if (e) return `<msqrt>${e}</msqrt>`;
+    const fallback = stripOmmlWrappers(inner).trim();
+    if (fallback) return `<msqrt>${fallback}</msqrt>`;
+    return full;
   });
 
-  // Optional: remove m: prefixes for common OMML nodes that may trip the converter,
-  // but be conservative (only for tags often present in OMML that we've touched).
-  // This helps if convert expects plain MathML tags like <msqrt>.
+  // PASS 3: nested/other <m:rad> patterns not caught earlier
+  s = s.replace(/<m:rad\b[^>]*>([\s\S]*?)<\/m:rad>/gi, (full, inner) => {
+    const degMatch = inner.match(/<m:deg\b[^>]*>([\s\S]*?)<\/m:deg>/i);
+    const eMatch = inner.match(/<m:e\b[^>]*>([\s\S]*?)<\/m:e>/i);
+    const deg = degMatch ? stripOmmlWrappers(degMatch[1]).trim() : "";
+    const e = eMatch ? stripOmmlWrappers(eMatch[1]).trim() : "";
+    if (e && deg) return `<mroot>${e}${deg}</mroot>`;
+    if (e) return `<msqrt>${e}</msqrt>`;
+    return full;
+  });
+
+  // PASS 4: remove m: prefix for common MathML tags to help converter
   s = s
     .replace(/<m:msqrt/gi, "<msqrt")
     .replace(/<\/m:msqrt/gi, "</msqrt")
@@ -216,42 +241,72 @@ function normalizeRadicalsInMathML(mml) {
     .replace(/<m:mi/gi, "<mi")
     .replace(/<\/m:mi/gi, "</mi")
     .replace(/<m:mo/gi, "<mo")
-    .replace(/<\/m:mo/gi, "</mo");
+    .replace(/<\/m:mo/gi, "</mo")
+    .replace(/<m:mrow/gi, "<mrow")
+    .replace(/<\/m:mrow/gi, "</mrow");
+
+  // PASS 5: collapse obvious wrapper runs into their inner text
+  s = s.replace(/<m:r\b[^>]*>([\s\S]*?)<\/m:r>/gi, (_, inside) => stripOmmlWrappers(inside));
+  s = s.replace(/<r\b[^>]*>([\s\S]*?)<\/r>/gi, (_, inside) => stripOmmlWrappers(inside));
 
   return s;
 }
 
+/**
+ * Try MathML -> LaTeX with multiple fallback strategies.
+ * Returns object: { latex: string, failedMml: string|null }
+ */
 function mathmlToLatexSafe(mml) {
   try {
-    if (!mml || !mml.includes("<math")) return "";
-    // First try: as-is
-    const latex = MathMLToLaTeX.convert(mml);
-    if (latex && String(latex).trim()) return (latex || "").trim();
+    if (!mml || !mml.includes("<math")) return { latex: "", failedMml: null };
 
-    // Fallback: try to normalize OMML-style radicals into MathML and convert again
+    // 1) try as-is
+    try {
+      const latex = MathMLToLaTeX.convert(mml);
+      if (latex && String(latex).trim()) return { latex: (latex || "").trim(), failedMml: null };
+    } catch {}
+
+    // 2) normalize radicals/OMML wrappers
     const normalized = normalizeRadicalsInMathML(mml);
-    if (normalized !== mml) {
+    if (normalized && normalized !== mml) {
       try {
         const latex2 = MathMLToLaTeX.convert(normalized);
-        if (latex2 && String(latex2).trim()) return (latex2 || "").trim();
-      } catch {
-        // ignore and fall through
+        if (latex2 && String(latex2).trim()) return { latex: (latex2 || "").trim(), failedMml: null };
+      } catch {}
+    }
+
+    // 3) more aggressive prefix removal + wrapper strip
+    let step3 = normalized || mml;
+    step3 = step3
+      .replace(/<\/?m:([a-zA-Z0-9]+)/g, (m) => m.replace(/^<m:/, "<").replace(/^<\/m:/, "</"))
+      .replace(/<m:r\b[^>]*>([\s\S]*?)<\/m:r>/gi, (_, inside) => stripOmmlWrappers(inside));
+    try {
+      const latex3 = MathMLToLaTeX.convert(step3);
+      if (latex3 && String(latex3).trim()) return { latex: (latex3 || "").trim(), failedMml: null };
+    } catch {}
+
+    // 4) best-effort collapse to msqrt if radical-like found
+    const hasRad = /<mroot|<msqrt|<rad|<m:rad/i.test(mml);
+    if (hasRad) {
+      const plain = stripOmmlWrappers(mml).replace(/<[^>]+>/g, "").trim();
+      if (plain) {
+        const guess = `<math><msqrt><mrow><mi>${plain}</mi></mrow></msqrt></math>`;
+        try {
+          const latex4 = MathMLToLaTeX.convert(guess);
+          if (latex4 && String(latex4).trim()) return { latex: (latex4 || "").trim(), failedMml: null };
+        } catch {}
       }
     }
 
-    return "";
+    // all failed
+    return { latex: "", failedMml: DEBUG_MT ? mml : null };
   } catch {
-    return "";
+    return { latex: "", failedMml: DEBUG_MT ? mml : null };
   }
 }
 
-/**
- * MathType FIRST:
- * - token [!m:$mathtype_x$]
- * - produce:
- *   latexMap[key] = "..."
- *   (optional) images["fallback_key"] = png dataURL if latex fails
- */
+/* ================= Tokenize MathType objects (unchanged flow + fallback images) ================= */
+
 async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
   let idx = 0;
   const found = {}; // key -> { oleTarget, previewRid }
@@ -276,6 +331,7 @@ async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
   });
 
   const latexMap = {};
+  const failedMathML = {};
 
   await Promise.all(
     Object.entries(found).map(async ([key, info]) => {
@@ -295,11 +351,15 @@ async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
         }
       }
 
-      // 3) MathML -> LaTeX
-      const latex = mml ? mathmlToLatexSafe(mml) : "";
-      if (latex) {
-        latexMap[key] = latex;
-        return;
+      // 3) MathML -> LaTeX via robust function
+      if (mml) {
+        const { latex, failedMml } = mathmlToLatexSafe(mml);
+        if (latex) {
+          latexMap[key] = latex;
+          return;
+        } else {
+          if (failedMml) failedMathML[key] = failedMml;
+        }
       }
 
       // 4) If no latex, fallback to preview image (convert emf/wmf->png)
@@ -331,12 +391,11 @@ async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
     })
   );
 
-  return { outXml: docXml, latexMap };
+  return { outXml: docXml, latexMap, failedMathML };
 }
 
-/**
- * Tokenize normal images AFTER MathType (and convert EMF/WMF -> PNG if possible)
- */
+/* ================= Tokenize normal images (unchanged) ================= */
+
 async function tokenizeImagesAfter(docXml, rels, zipFiles) {
   let idx = 0;
   const imgMap = {};
@@ -389,52 +448,39 @@ async function tokenizeImagesAfter(docXml, rels, zipFiles) {
   return { outXml: docXml, imgMap };
 }
 
-/* ================= Text & Questions ================= */
-/**
- * ✅ HOÀN THIỆN:
- * - GIỮ token [!m:$...$]/[!img:$...$] để HTML render công thức + ảnh
- * - GIỮ underline bằng <u>...</u>
- * - Không đổi thuật toán MathType/LaTeX phía trên
- */
+/* ================= Text & Questions (unchanged) ================= */
+
 function wordXmlToTextKeepTokens(docXml) {
   let x = docXml
     .replace(/<w:tab\s*\/>/g, "\t")
     .replace(/<w:br\s*\/>/g, "\n")
     .replace(/<\/w:p>/g, "\n");
 
-  // 1) Protect tokens BEFORE stripping tags (both $key$ and $$key$$)
+  // Protect tokens BEFORE stripping tags
   x = x.replace(/\[!m:\$\$?(.*?)\$\$?\]/g, "___MATH_TOKEN___$1___END___");
   x = x.replace(/\[!img:\$\$?(.*?)\$\$?\]/g, "___IMG_TOKEN___$1___END___");
 
-  // 2) Convert each run <w:r> while preserving underline + token text
+  // Convert each run <w:r> while preserving underline + token text
   x = x.replace(/<w:r\b[\s\S]*?<\/w:r>/g, (run) => {
     const hasU =
       /<w:u\b[^>]*\/>/.test(run) &&
       !/<w:u\b[^>]*w:val="none"[^>]*\/>/.test(run);
 
-    // remove run properties but keep content (tokens are plain text)
     let inner = run.replace(/<w:rPr\b[\s\S]*?<\/w:rPr>/g, "");
-
-    // w:t -> raw text
     inner = inner.replace(/<w:t\b[^>]*>([\s\S]*?)<\/w:t>/g, (_, t) => t ?? "");
-
-    // optional instrText
     inner = inner.replace(
       /<w:instrText\b[^>]*>([\s\S]*?)<\/w:instrText>/g,
       (_, t) => t ?? ""
     );
-
-    // remove remaining tags inside run
     inner = inner.replace(/<[^>]+>/g, "");
-
     if (!inner) return "";
     return hasU ? `<u>${inner}</u>` : inner;
   });
 
-  // 3) Remove remaining tags outside runs, but keep <u>
+  // Remove remaining tags outside runs, but keep <u>
   x = x.replace(/<(?!\/?u\b)[^>]+>/g, "");
 
-  // 4) Restore tokens in a stable form (use $$ ... $$)
+  // Restore tokens in a stable form (use $$ ... $$)
   x = x
     .replace(/___MATH_TOKEN___(.*?)___END___/g, "[!m:$$$1$$]")
     .replace(/___IMG_TOKEN___(.*?)___END___/g, "[!img:$$$1$$]");
@@ -466,7 +512,6 @@ function parseQuestions(text) {
     const [main, solution] = block.split(/Lời giải/i);
     q.solution = solution ? solution.trim() : "";
 
-    // ✅ giữ nguyên thuật toán parse đáp án của bạn
     const choiceRe =
       /(\*?)([A-D])\.\s([\s\S]*?)(?=\n\*?[A-D]\.\s|\nLời giải|$)/g;
 
@@ -506,31 +551,36 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     const relsXml = (await relEntry.buffer()).toString("utf8");
     const rels = parseRels(relsXml);
 
-    // 1) MathType -> LaTeX (and fallback images) ✅ giữ nguyên
+    // 1) MathType -> LaTeX (and fallback images)
     const images = {};
     const mt = await tokenizeMathTypeOleFirst(docXml, rels, zip.files, images);
     docXml = mt.outXml;
-    const latexMap = mt.latexMap;
+    const latexMap = mt.latexMap || {};
+    const failedMathML = mt.failedMathML || {};
 
-    // 2) normal images ✅ giữ nguyên
+    // 2) normal images
     const imgTok = await tokenizeImagesAfter(docXml, rels, zip.files);
     docXml = imgTok.outXml;
     Object.assign(images, imgTok.imgMap);
 
-    // 3) text ✅ giờ giữ token + underline
+    // 3) text: keep token + underline
     const text = wordXmlToTextKeepTokens(docXml);
 
-    // 4) parse questions ✅ giữ nguyên
+    // 4) parse questions
     const questions = parseQuestions(text);
 
-    res.json({
+    const resp = {
       ok: true,
       total: questions.length,
       questions,
       latex: latexMap,
       images,
       rawText: text,
-    });
+    };
+
+    if (DEBUG_MT) resp.failedMathML = failedMathML;
+
+    res.json(resp);
   } catch (err) {
     console.error(err);
     res.status(500).json({ ok: false, error: err?.message || String(err) });
