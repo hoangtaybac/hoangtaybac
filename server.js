@@ -445,45 +445,6 @@ function preprocessMathMLForSqrt(mathml) {
 
   return s;
 }
-
-// THỬ Ở ĐÂY 
- * ✅ FIX: Post-process LaTeX to fix any remaining sqrt issues
- */
-function postprocessLatexSqrt(latex) {
-  if (!latex) return latex;
-  let s = String(latex);
-
-  // Some converters output \\surd instead of \\sqrt
-  s = s.replace(/\\surd\b/g, "\\sqrt{}");
-
-  // Fix: Sometimes √ symbol remains unconverted
-  s = s.replace(/√\s*\{([^}]+)\}/g, "\\sqrt{$1}");
-  s = s.replace(/√\s*\(([^)]+)\)/g, "\\sqrt{$1}");
-  s = s.replace(/√\s*(\d+)/g, "\\sqrt{$1}");
-  s = s.replace(/√\s*([a-zA-Z])/g, "\\sqrt{$1}");
-
-  // Fix: \sqrt without braces - add braces for single character/number
-  s = s.replace(/\\sqrt\s+(\d+)(?![}\d])/g, "\\sqrt{$1}");
-  s = s.replace(/\\sqrt\s+([a-zA-Z])(?![}\w])/g, "\\sqrt{$1}");
-
-  // Fix: Empty sqrt
-  s = s.replace(/\\sqrt\s*\{\s*\}/g, "\\sqrt{\\phantom{x}}");
-
-  // Fix: Malformed sqrt with extra spaces
-  s = s.replace(/\\sqrt\s+\{/g, "\\sqrt{");
-
-  // Fix: nth root - \sqrt[n]{x}
-  s = s.replace(/\\root\s*\{([^}]+)\}\s*\\of\s*\{([^}]+)\}/g, "\\sqrt[$1]{$2}");
-  s = s.replace(/\\sqrt\s*\[\s*(\d+)\s*\]\s*\{/g, "\\sqrt[$1]{");
-
-  return s;
-}
-// HẾT THỬ 
-
-
-
-
-
 /* ================= Text & Questions ================= */
 /**
  * ✅ HOÀN THIỆN:
