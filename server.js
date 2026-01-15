@@ -111,6 +111,7 @@ async function maybeConvertEmfWmfToPng(buf, filename) {
 }
 
 /* ================= MathType OLE -> MathML -> LaTeX ================= */
+
 /**
  * scan MathML embedded directly in OLE (nhanh)
  */
@@ -311,14 +312,11 @@ async function tokenizeImagesAfter(docXml, rels, zipFiles) {
 }
 
 /* ================= Text & Questions ================= */
-
 /**
- * ✅ GIỮ GẠCH CHÂN:
- * - Trong DOCX, underline nằm trong <w:rPr><w:u .../>
- * - Ta duyệt từng <w:r> (run) để biết run nào underline
- * - Nếu underline => bọc text run đó bằng <u>...</u>
- *
- * ⚠️ Không đụng tới token MathType/Image/LaTeX.
+ * ✅ HOÀN THIỆN:
+ * - GIỮ token [!m:$...$]/[!img:$...$] để HTML render công thức + ảnh
+ * - GIỮ underline bằng <u>...</u>
+ * - Không đổi thuật toán MathType/LaTeX phía trên
  */
 function wordXmlToTextKeepTokens(docXml) {
   let x = docXml
@@ -326,42 +324,39 @@ function wordXmlToTextKeepTokens(docXml) {
     .replace(/<w:br\s*\/>/g, "\n")
     .replace(/<\/w:p>/g, "\n");
 
-  // keep tokens
-  x = x.replace(/\[!m:\$(.*?)\$\]/g, "___MATH_TOKEN___$1___END___");
-  x = x.replace(/\[!img:\$(.*?)\$\]/g, "___IMG_TOKEN___$1___END___");
+  // 1) Protect tokens BEFORE stripping tags (both $key$ and $$key$$)
+  x = x.replace(/\[!m:\$\$?(.*?)\$\$?\]/g, "___MATH_TOKEN___$1___END___");
+  x = x.replace(/\[!img:\$\$?(.*?)\$\$?\]/g, "___IMG_TOKEN___$1___END___");
 
-  // Convert each run <w:r> to text, preserving underline via <u>...</u>
+  // 2) Convert each run <w:r> while preserving underline + token text
   x = x.replace(/<w:r\b[\s\S]*?<\/w:r>/g, (run) => {
-    // underline exists and not "none"
     const hasU =
       /<w:u\b[^>]*\/>/.test(run) &&
       !/<w:u\b[^>]*w:val="none"[^>]*\/>/.test(run);
 
-    // collect text inside run (can be multiple w:t)
-    let txt = "";
-    run.replace(/<w:t\b[^>]*>([\s\S]*?)<\/w:t>/g, (_, t) => {
-      txt += t ?? "";
-      return _;
-    });
+    // remove run properties but keep content (tokens are plain text)
+    let inner = run.replace(/<w:rPr\b[\s\S]*?<\/w:rPr>/g, "");
 
-    // optional: instrText
-    run.replace(/<w:instrText\b[^>]*>([\s\S]*?)<\/w:instrText>/g, (_, t) => {
-      txt += t ?? "";
-      return _;
-    });
+    // w:t -> raw text
+    inner = inner.replace(/<w:t\b[^>]*>([\s\S]*?)<\/w:t>/g, (_, t) => t ?? "");
 
-    if (!txt) return "";
+    // optional instrText
+    inner = inner.replace(
+      /<w:instrText\b[^>]*>([\s\S]*?)<\/w:instrText>/g,
+      (_, t) => t ?? ""
+    );
 
-    return hasU ? `<u>${txt}</u>` : txt;
+    // remove remaining tags inside run
+    inner = inner.replace(/<[^>]+>/g, "");
+
+    if (!inner) return "";
+    return hasU ? `<u>${inner}</u>` : inner;
   });
 
-  // Safety: any leftover <w:t> not captured
-  x = x.replace(/<w:t\b[^>]*>([\s\S]*?)<\/w:t>/g, (_, t) => t ?? "");
-
-  // Remove all tags EXCEPT <u> and </u>
+  // 3) Remove remaining tags outside runs, but keep <u>
   x = x.replace(/<(?!\/?u\b)[^>]+>/g, "");
 
-  // restore tokens
+  // 4) Restore tokens in a stable form (use $$ ... $$)
   x = x
     .replace(/___MATH_TOKEN___(.*?)___END___/g, "[!m:$$$1$$]")
     .replace(/___IMG_TOKEN___(.*?)___END___/g, "[!img:$$$1$$]");
@@ -433,7 +428,7 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     const relsXml = (await relEntry.buffer()).toString("utf8");
     const rels = parseRels(relsXml);
 
-    // 1) MathType -> LaTeX (and fallback images)  ✅ giữ nguyên
+    // 1) MathType -> LaTeX (and fallback images) ✅ giữ nguyên
     const images = {};
     const mt = await tokenizeMathTypeOleFirst(docXml, rels, zip.files, images);
     docXml = mt.outXml;
@@ -444,7 +439,7 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     docXml = imgTok.outXml;
     Object.assign(images, imgTok.imgMap);
 
-    // 3) text (NOW keeps underline) ✅ chỉ sửa chỗ này
+    // 3) text ✅ giờ giữ token + underline
     const text = wordXmlToTextKeepTokens(docXml);
 
     // 4) parse questions ✅ giữ nguyên
@@ -454,9 +449,9 @@ app.post("/upload", upload.single("file"), async (req, res) => {
       ok: true,
       total: questions.length,
       questions,
-      latex: latexMap, // ✅ LaTeX like Azota
-      images,          // fallback image if latex empty
-      rawText: text,   // contains <u>...</u> for underlined segments
+      latex: latexMap,
+      images,
+      rawText: text,
     });
   } catch (err) {
     console.error(err);
