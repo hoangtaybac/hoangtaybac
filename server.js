@@ -6,6 +6,7 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { execFile, execFileSync } from "child_process";
+import { MathMLToLaTeX } from "mathml-to-latex";
 
 const app = express();
 app.use(cors());
@@ -68,15 +69,20 @@ async function getZipEntryBuffer(zipFiles, p) {
   return await f.buffer();
 }
 
-/**
- * Convert EMF/WMF -> PNG using Inkscape
- */
+/* ================= Inkscape Convert EMF/WMF -> PNG ================= */
+
 function inkscapeConvertToPng(inputPath, outputPath) {
   return new Promise((resolve, reject) => {
     execFile(
       "inkscape",
-      [inputPath, "--export-type=png", `--export-filename=${outputPath}`],
-      { timeout: 20000 },
+      [
+        inputPath,
+        "--export-type=png",
+        `--export-filename=${outputPath}`,
+        "--export-area-drawing",
+        "--export-background-opacity=0",
+      ],
+      { timeout: 30000 },
       (err, stdout, stderr) => {
         if (err) return reject(new Error(stderr || err.message));
         resolve(true);
@@ -96,8 +102,7 @@ async function maybeConvertEmfWmfToPng(buf, filename) {
   try {
     fs.writeFileSync(inPath, buf);
     await inkscapeConvertToPng(inPath, outPath);
-    const png = fs.readFileSync(outPath);
-    return png;
+    return fs.readFileSync(outPath);
   } finally {
     try {
       fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -105,10 +110,12 @@ async function maybeConvertEmfWmfToPng(buf, filename) {
   }
 }
 
+/* ================= MathType OLE -> MathML -> LaTeX ================= */
+
 /**
- * Try extract embedded MathML from MathType OLE binary (scan <math>...</math>)
+ * scan MathML embedded directly in OLE (nhanh)
  */
-function extractMathMLFromOle(buf) {
+function extractMathMLFromOleScan(buf) {
   const utf8 = buf.toString("utf8");
   let i = utf8.indexOf("<math");
   if (i !== -1) {
@@ -127,10 +134,44 @@ function extractMathMLFromOle(buf) {
 }
 
 /**
+ * fallback: call ruby mt2mml.rb ole.bin -> MathML
+ */
+function rubyOleToMathML(oleBuf) {
+  return new Promise((resolve, reject) => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ole-"));
+    const inPath = path.join(tmpDir, "oleObject.bin");
+    fs.writeFileSync(inPath, oleBuf);
+
+    execFile(
+      "ruby",
+      ["mt2mml.rb", inPath],
+      { timeout: 30000, maxBuffer: 20 * 1024 * 1024 },
+      (err, stdout, stderr) => {
+        try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+        if (err) return reject(new Error(stderr || err.message));
+        resolve(String(stdout || "").trim());
+      }
+    );
+  });
+}
+
+function mathmlToLatexSafe(mml) {
+  try {
+    if (!mml || !mml.includes("<math")) return "";
+    // mathml-to-latex expects a MathML string
+    const latex = MathMLToLaTeX.convert(mml);
+    return (latex || "").trim();
+  } catch {
+    return "";
+  }
+}
+
+/**
  * MathType FIRST:
- * - Replace <w:object> with [!m:$mathtype_x$]
- * - Extract MathML from oleObject.bin
- * - If no MathML: fallback preview rid and return fallback image dataURL in images[fallback_key]
+ * - token [!m:$mathtype_x$]
+ * - produce:
+ *   latexMap[key] = "..."
+ *   (optional) images["fallback_key"] = png dataURL if latex fails
  */
 async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
   let idx = 0;
@@ -155,22 +196,34 @@ async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
     return `[!m:$${key}$]`;
   });
 
-  const mathMap = {};
+  const latexMap = {};
 
   await Promise.all(
     Object.entries(found).map(async ([key, info]) => {
       const oleFull = normalizeTargetToWordPath(info.oleTarget);
       const oleBuf = await getZipEntryBuffer(zipFiles, oleFull);
 
-      if (oleBuf) {
-        const mml = extractMathMLFromOle(oleBuf);
-        if (mml && mml.trim()) {
-          mathMap[key] = mml;
-          return;
+      // 1) try scan MathML inside OLE
+      let mml = "";
+      if (oleBuf) mml = extractMathMLFromOleScan(oleBuf) || "";
+
+      // 2) fallback ruby convert (MTEF inside OLE)
+      if (!mml && oleBuf) {
+        try {
+          mml = await rubyOleToMathML(oleBuf);
+        } catch {
+          mml = "";
         }
       }
 
-      // fallback preview image
+      // 3) MathML -> LaTeX
+      const latex = mml ? mathmlToLatexSafe(mml) : "";
+      if (latex) {
+        latexMap[key] = latex;
+        return;
+      }
+
+      // 4) If no latex, fallback to preview image (convert emf/wmf->png)
       if (info.previewRid) {
         const t = rels.get(info.previewRid);
         if (t) {
@@ -178,35 +231,32 @@ async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
           const imgBuf = await getZipEntryBuffer(zipFiles, imgFull);
           if (imgBuf) {
             const mime = guessMimeFromFilename(imgFull);
-
-            // convert emf/wmf -> png
             if (mime === "image/emf" || mime === "image/wmf") {
               try {
                 const pngBuf = await maybeConvertEmfWmfToPng(imgBuf, imgFull);
                 if (pngBuf) {
                   images[`fallback_${key}`] =
                     `data:image/png;base64,${pngBuf.toString("base64")}`;
-                  mathMap[key] = ""; // no MathML
+                  latexMap[key] = "";
                   return;
                 }
               } catch {}
             }
-
             images[`fallback_${key}`] =
               `data:${mime};base64,${imgBuf.toString("base64")}`;
           }
         }
       }
 
-      mathMap[key] = "";
+      latexMap[key] = "";
     })
   );
 
-  return { outXml: docXml, mathMap };
+  return { outXml: docXml, latexMap };
 }
 
 /**
- * Tokenize normal images AFTER MathType
+ * Tokenize normal images AFTER MathType (and convert EMF/WMF -> PNG if possible)
  */
 async function tokenizeImagesAfter(docXml, rels, zipFiles) {
   let idx = 0;
@@ -224,7 +274,6 @@ async function tokenizeImagesAfter(docXml, rels, zipFiles) {
         if (!buf) return;
 
         const mime = guessMimeFromFilename(full);
-
         if (mime === "image/emf" || mime === "image/wmf") {
           try {
             const pngBuf = await maybeConvertEmfWmfToPng(buf, full);
@@ -234,7 +283,6 @@ async function tokenizeImagesAfter(docXml, rels, zipFiles) {
             }
           } catch {}
         }
-
         imgMap[key] = `data:${mime};base64,${buf.toString("base64")}`;
       })()
     );
@@ -262,58 +310,29 @@ async function tokenizeImagesAfter(docXml, rels, zipFiles) {
   return { outXml: docXml, imgMap };
 }
 
-/**
- * ✅ KEY FIX: Convert Word XML to text BUT KEEP underline markers
- *
- * - Keeps tokens [!m:$..$] and [!img:$..$]
- * - Preserves underline run by wrapping run text with [[U]]...[[/U]]
- *
- * NOTE: underline in Word = <w:rPr>...<w:u .../>...</w:rPr>
- */
-function wordXmlToTextKeepTokensAndUnderline(docXml) {
-  // Normalize paragraph + breaks + tabs
+/* ================= Text & Questions ================= */
+
+function wordXmlToTextKeepTokens(docXml) {
   let x = docXml
     .replace(/<w:tab\s*\/>/g, "\t")
     .replace(/<w:br\s*\/>/g, "\n")
     .replace(/<\/w:p>/g, "\n");
 
-  // Protect our tokens before we mess with tags
+  // keep tokens
   x = x.replace(/\[!m:\$(.*?)\$\]/g, "___MATH_TOKEN___$1___END___");
   x = x.replace(/\[!img:\$(.*?)\$\]/g, "___IMG_TOKEN___$1___END___");
 
-  // Convert runs: <w:r> ... </w:r>
-  // If run has underline (<w:u .../>) => wrap its text with [[U]]..[[/U]]
-  x = x.replace(/<w:r\b[\s\S]*?<\/w:r>/g, (run) => {
-    const isUnderline =
-      /<w:rPr[\s\S]*?<w:u\b[^>]*\/>[\s\S]*?<\/w:rPr>/.test(run) ||
-      /<w:u\b[^>]*\/>/.test(run);
-
-    // Extract all <w:t> segments in this run (can be multiple)
-    let txt = "";
-    run.replace(/<w:t\b[^>]*>([\s\S]*?)<\/w:t>/g, (m, inner) => {
-      txt += inner;
-      return m;
-    });
-
-    // If run contains no text, ignore it
-    if (!txt) return "";
-
-    // Wrap underline marker
-    if (isUnderline) {
-      return `[[U]]${txt}[[/U]]`;
-    }
-    return txt;
+  x = x.replace(/<w:t\b[^>]*>[\s\S]*?<\/w:t>/g, (seg) => {
+    const mm = seg.match(/<w:t\b[^>]*>([\s\S]*?)<\/w:t>/);
+    return mm ? mm[1] : "";
   });
 
-  // Remove leftover tags
   x = x.replace(/<[^>]+>/g, "");
 
-  // Restore our tokens
   x = x
     .replace(/___MATH_TOKEN___(.*?)___END___/g, "[!m:$$$1$$]")
     .replace(/___IMG_TOKEN___(.*?)___END___/g, "[!img:$$$1$$]");
 
-  // Decode entities + cleanup
   x = decodeXmlEntities(x)
     .replace(/\r/g, "")
     .replace(/[ \t]+\n/g, "\n")
@@ -323,11 +342,6 @@ function wordXmlToTextKeepTokensAndUnderline(docXml) {
   return x;
 }
 
-/**
- * ✅ Parse questions:
- * - MCQ A-D
- * - Detect correct answer from underline marker [[U]] in choice text
- */
 function parseQuestions(text) {
   const blocks = text.split(/(?=Câu\s+\d+\.)/);
   const questions = [];
@@ -341,44 +355,25 @@ function parseQuestions(text) {
       choices: [],
       correct: null,
       solution: "",
-      no: null,
     };
-
-    const mNo = block.match(/^Câu\s*(\d+)\./);
-    q.no = mNo ? parseInt(mNo[1], 10) : null;
 
     const [main, solution] = block.split(/Lời giải/i);
     q.solution = solution ? solution.trim() : "";
 
-    // Parse choices A-D robust
     const choiceRe =
       /(\*?)([A-D])\.\s([\s\S]*?)(?=\n\*?[A-D]\.\s|\nLời giải|$)/g;
+
     let m;
     while ((m = choiceRe.exec(main))) {
       const starred = m[1] === "*";
       const label = m[2];
       const content = (m[3] || "").trim();
-
       if (starred) q.correct = label;
-
-      // ✅ underline-based correct
-      if (!q.correct && content.includes("[[U]]")) {
-        q.correct = label;
-      }
-
       q.choices.push({ label, text: content });
     }
 
-    // content = stem
     const splitAtA = main.split(/\n\*?A\.\s/);
-    q.content = (splitAtA[0] || "").trim();
-
-    // fallback: "Chọn C" in solution
-    if (!q.correct && q.solution) {
-      const pick = q.solution.match(/\bChọn\s*([A-D])\b/i);
-      if (pick) q.correct = pick[1].toUpperCase();
-    }
-
+    q.content = splitAtA[0].trim();
     questions.push(q);
   }
 
@@ -402,37 +397,26 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     const relsXml = (await relEntry.buffer()).toString("utf8");
     const rels = parseRels(relsXml);
 
-    // ✅ MathType first (fallback preview + convert emf/wmf -> png)
+    // 1) MathType -> LaTeX (and fallback images)
     const images = {};
-    const mathTok = await tokenizeMathTypeOleFirst(docXml, rels, zip.files, images);
-    docXml = mathTok.outXml;
-    const mathMap = mathTok.mathMap;
+    const mt = await tokenizeMathTypeOleFirst(docXml, rels, zip.files, images);
+    docXml = mt.outXml;
+    const latexMap = mt.latexMap;
 
-    // ✅ Then normal images (also convert emf/wmf -> png)
+    // 2) normal images
     const imgTok = await tokenizeImagesAfter(docXml, rels, zip.files);
     docXml = imgTok.outXml;
     Object.assign(images, imgTok.imgMap);
 
-    // ✅ Convert XML -> text but keep underline markers
-    const text = wordXmlToTextKeepTokensAndUnderline(docXml);
-
-    // ✅ Parse quiz
+    const text = wordXmlToTextKeepTokens(docXml);
     const questions = parseQuestions(text);
-
-    // NOTE: bạn đang render LaTeX ở HTML từ data.latex.
-    // Nếu hiện tại bạn chưa có converter MathML->LaTeX thì tạm trả latexMap rỗng,
-    // HTML sẽ fallback ảnh công thức (fallback_mathtype_x).
-    // Khi bạn đã có latex converter, chỉ cần set latexMap[key] = "...".
-    const latexMap = {}; // <-- bạn có thể nối vào pipeline LaTeX sau
 
     res.json({
       ok: true,
       total: questions.length,
       questions,
-      // trả cả math (MathML) để debug nếu cần
-      math: mathMap,
-      latex: latexMap,
-      images,
+      latex: latexMap,  // ✅ LaTeX like Azota
+      images,           // fallback image if latex empty
       rawText: text,
     });
   } catch (err) {
@@ -447,7 +431,7 @@ app.get("/debug-inkscape", (_, res) => {
   try {
     const v = execFileSync("inkscape", ["--version"]).toString();
     res.type("text/plain").send(v);
-  } catch (e) {
+  } catch {
     res.status(500).type("text/plain").send("NO INKSCAPE");
   }
 });
