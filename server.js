@@ -2,7 +2,6 @@ import express from "express";
 import multer from "multer";
 import unzipper from "unzipper";
 import cors from "cors";
-import path from "path";
 
 const app = express();
 app.use(cors());
@@ -31,15 +30,12 @@ function guessMimeFromFilename(filename = "") {
   if (ext === "bmp") return "image/bmp";
   if (ext === "webp") return "image/webp";
   if (ext === "svg") return "image/svg+xml";
-  // docx đôi khi là emf/wmf (browser không hiển thị native). Bạn cần convert nếu gặp.
+  // emf/wmf: browser thường không render -> vẫn trả về để bạn thấy token, muốn giống Azota 100% cần convert sang png
   if (ext === "emf") return "image/emf";
   if (ext === "wmf") return "image/wmf";
   return "application/octet-stream";
 }
 
-/**
- * Decode cơ bản entity trong XML (đủ cho docx text).
- */
 function decodeXmlEntities(s = "") {
   return s
     .replace(/&lt;/g, "<")
@@ -53,9 +49,20 @@ function decodeXmlEntities(s = "") {
     );
 }
 
+async function getZipEntryBuffer(zipFiles, p) {
+  const f = zipFiles.find((x) => x.path === p);
+  if (!f) return null;
+  return await f.buffer();
+}
+
+function normalizeTargetToWordPath(target) {
+  let t = (target || "").replace(/^(\.\.\/)+/, ""); // bỏ ../
+  if (!t.startsWith("word/")) t = `word/${t}`;
+  return t;
+}
+
 /**
  * Try extract embedded MathML from MathType OLE binary.
- * MathType thường có MathML “dịch sẵn” trong OLE.
  */
 function extractMathMLFromOle(buf) {
   // UTF-8 scan
@@ -66,7 +73,7 @@ function extractMathMLFromOle(buf) {
     if (j !== -1) return utf8.slice(i, j + 7);
   }
 
-  // UTF-16LE scan (rất hay gặp trong OLE)
+  // UTF-16LE scan
   const u16 = buf.toString("utf16le");
   i = u16.indexOf("<math");
   if (i !== -1) {
@@ -78,77 +85,17 @@ function extractMathMLFromOle(buf) {
 }
 
 /**
- * Lấy buffer file trong zip theo path
+ * 1) Tokenize MathType OLE FIRST
+ * - Replace each <w:object>...</w:object> containing <o:OLEObject r:id="...">
+ *   with token [!m:$mathtype_1$]
+ * - Extract MathML from embeddings/oleObjectX.bin
+ * - If no MathML => fallback to preview image RID inside the same block
+ *   (supports both v:imagedata r:id and a:blip r:embed)
+ * - Store fallback image as images["fallback_mathtype_1"] = dataURL
  */
-async function getZipEntryBuffer(zipFiles, p) {
-  const f = zipFiles.find((x) => x.path === p);
-  if (!f) return null;
-  return await f.buffer();
-}
-
-/**
- * 1) Tokenize IMAGE:
- * - drawing: <a:blip r:embed="rIdX" .../>
- * - vml: <v:imagedata r:id="rIdY" .../>
- *
- * Thay chúng bằng token: [!img:$img_1$]
- * và tạo imgMap: img_1 -> dataURL
- */
-async function tokenizeImages(docXml, rels, zipFiles) {
-  let idx = 0;
-  const imgMap = {};
-  const jobs = [];
-
-  function scheduleImageJob(rid, key) {
-    const target = rels.get(rid);
-    if (!target) return;
-
-    // target thường kiểu "media/image1.png" hoặc "../media/..."
-    // normalize về word/...
-    let normalized = target.replace(/^(\.\.\/)+/, ""); // bỏ ../
-    if (!normalized.startsWith("word/")) normalized = `word/${normalized}`;
-
-    jobs.push(
-      (async () => {
-        const buf = await getZipEntryBuffer(zipFiles, normalized);
-        if (!buf) return;
-
-        const mime = guessMimeFromFilename(normalized);
-        // Nếu là emf/wmf: browser khó render -> vẫn trả về để bạn biết, muốn chuẩn thì cần convert sang png.
-        const b64 = buf.toString("base64");
-        imgMap[key] = `data:${mime};base64,${b64}`;
-      })()
-    );
-  }
-
-  // a:blip r:embed
-  docXml = docXml.replace(/<a:blip\b[^>]*\br:embed="([^"]+)"[^>]*\/>/g, (m, rid) => {
-    const key = `img_${++idx}`;
-    scheduleImageJob(rid, key);
-    return `[!img:$${key}$]`;
-  });
-
-  // v:imagedata r:id
-  docXml = docXml.replace(/<v:imagedata\b[^>]*\br:id="([^"]+)"[^>]*\/>/g, (m, rid) => {
-    const key = `img_${++idx}`;
-    scheduleImageJob(rid, key);
-    return `[!img:$${key}$]`;
-  });
-
-  await Promise.all(jobs);
-  return { outXml: docXml, imgMap };
-}
-
-/**
- * 2) Tokenize MathType OLE:
- * - Tìm <w:object>...</w:object> có <o:OLEObject r:id="...">
- * - Thay toàn block bằng [!m:$mathtype_1$] (ưu tiên MathML)
- * - Nếu không extract được MathML => fallback ảnh preview nếu có v:imagedata trong block
- */
-async function tokenizeMathTypeOle(docXml, rels, zipFiles, imgMap) {
+async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
   let idx = 0;
   const mathMap = {};
-  const jobs = [];
 
   const OBJECT_RE = /<w:object[\s\S]*?<\/w:object>/g;
 
@@ -157,105 +104,145 @@ async function tokenizeMathTypeOle(docXml, rels, zipFiles, imgMap) {
     if (!ole) return block;
 
     const oleRid = ole[1];
-    const oleTarget = rels.get(oleRid); // embeddings/oleObject1.bin
+    const oleTarget = rels.get(oleRid);
     if (!oleTarget) return block;
 
-    // Nếu có preview image rid trong cùng block thì lấy để fallback
-    const imgRidMatch = block.match(/<v:imagedata\b[^>]*\br:id="([^"]+)"[^>]*\/>/);
-    const previewRid = imgRidMatch ? imgRidMatch[1] : null;
+    // preview rid can be vml or drawing blip
+    const vmlRid = block.match(
+      /<v:imagedata\b[^>]*\br:id="([^"]+)"[^>]*\/>/
+    );
+    const blipRid = block.match(
+      /<a:blip\b[^>]*\br:embed="([^"]+)"[^>]*\/>/
+    );
+    const previewRid = vmlRid?.[1] || blipRid?.[1] || null;
 
     const key = `mathtype_${++idx}`;
 
-    jobs.push(
-      (async () => {
-        let full = oleTarget.replace(/^(\.\.\/)+/, "");
-        if (!full.startsWith("word/")) full = `word/${full}`;
-
-        const buf = await getZipEntryBuffer(zipFiles, full);
-        if (!buf) {
-          mathMap[key] = "";
-          return;
-        }
-
-        const mml = extractMathMLFromOle(buf);
-        if (mml) {
-          mathMap[key] = mml;
-          return;
-        }
-
-        // Fallback: nếu OLE không có MathML -> dùng ảnh preview (nếu có)
-        if (previewRid) {
-          const target = rels.get(previewRid);
-          if (target) {
-            let normalized = target.replace(/^(\.\.\/)+/, "");
-            if (!normalized.startsWith("word/")) normalized = `word/${normalized}`;
-            const imgbuf = await getZipEntryBuffer(zipFiles, normalized);
-            if (imgbuf) {
-              const mime = guessMimeFromFilename(normalized);
-              imgMap[`fallback_${key}`] = `data:${mime};base64,${imgbuf.toString("base64")}`;
-              mathMap[key] = ""; // báo client: không có MathML, dùng fallback ảnh
-              return;
-            }
-          }
-        }
-
-        mathMap[key] = "";
-      })()
-    );
+    // We'll do the heavy extraction later by pushing jobs into a global list
+    // but because replace callback is sync, we mark placeholders in a side table.
+    mathMap[key] = { oleTarget, previewRid };
 
     return `[!m:$${key}$]`;
   });
 
-  await Promise.all(jobs);
-  return { outXml: docXml, mathMap };
+  // Execute extraction for all keys
+  const entries = Object.entries(mathMap);
+  const finalMath = {};
+
+  await Promise.all(
+    entries.map(async ([key, info]) => {
+      const oleFull = normalizeTargetToWordPath(info.oleTarget);
+      const buf = await getZipEntryBuffer(zipFiles, oleFull);
+
+      if (buf) {
+        const mml = extractMathMLFromOle(buf);
+        if (mml && mml.trim()) {
+          finalMath[key] = mml;
+          return;
+        }
+      }
+
+      // fallback image
+      if (info.previewRid) {
+        const t = rels.get(info.previewRid);
+        if (t) {
+          const imgFull = normalizeTargetToWordPath(t);
+          const imgbuf = await getZipEntryBuffer(zipFiles, imgFull);
+          if (imgbuf) {
+            const mime = guessMimeFromFilename(imgFull);
+            images[`fallback_${key}`] = `data:${mime};base64,${imgbuf.toString(
+              "base64"
+            )}`;
+          }
+        }
+      }
+
+      finalMath[key] = ""; // no MathML
+    })
+  );
+
+  return { outXml: docXml, mathMap: finalMath };
 }
 
 /**
- * 3) Convert Word XML -> TEXT nhưng giữ token [!m:...] [!img:...]
- * - giữ xuống dòng theo </w:p>
- * - giữ tab theo <w:tab/>
- * - giữ line break theo <w:br/>
- * - lấy text từ <w:t>...</w:t>
+ * 2) Tokenize normal images AFTER MathType
+ * - drawing: <a:blip r:embed="rIdX"/>
+ * - vml: <v:imagedata r:id="rIdY"/>
+ * Replace by token [!img:$img_1$] and store images map.
+ */
+async function tokenizeImagesAfter(docXml, rels, zipFiles) {
+  let idx = 0;
+  const imgMap = {};
+  const jobs = [];
+
+  const schedule = (rid, key) => {
+    const target = rels.get(rid);
+    if (!target) return;
+    const full = normalizeTargetToWordPath(target);
+
+    jobs.push(
+      (async () => {
+        const buf = await getZipEntryBuffer(zipFiles, full);
+        if (!buf) return;
+        const mime = guessMimeFromFilename(full);
+        imgMap[key] = `data:${mime};base64,${buf.toString("base64")}`;
+      })()
+    );
+  };
+
+  // a:blip
+  docXml = docXml.replace(
+    /<a:blip\b[^>]*\br:embed="([^"]+)"[^>]*\/>/g,
+    (m, rid) => {
+      const key = `img_${++idx}`;
+      schedule(rid, key);
+      return `[!img:$${key}$]`;
+    }
+  );
+
+  // v:imagedata
+  docXml = docXml.replace(
+    /<v:imagedata\b[^>]*\br:id="([^"]+)"[^>]*\/>/g,
+    (m, rid) => {
+      const key = `img_${++idx}`;
+      schedule(rid, key);
+      return `[!img:$${key}$]`;
+    }
+  );
+
+  await Promise.all(jobs);
+  return { outXml: docXml, imgMap };
+}
+
+/**
+ * 3) Convert Word XML to TEXT but keep tokens [!m:...] [!img:...]
+ * - keep new line from </w:p>, <w:br/>
+ * - keep tab from <w:tab/>
  */
 function wordXmlToTextKeepTokens(docXml) {
-  // Đổi paragraph + break + tab thành ký hiệu text
   let x = docXml
     .replace(/<w:tab\s*\/>/g, "\t")
     .replace(/<w:br\s*\/>/g, "\n")
     .replace(/<\/w:p>/g, "\n");
 
-  // Lấy nội dung trong w:t
-  const texts = [];
-  const re = /<w:t\b[^>]*>([\s\S]*?)<\/w:t>/g;
-  let m;
-  while ((m = re.exec(x))) {
-    texts.push(m[1]);
-  }
+  // Protect tokens before stripping tags
+  x = x.replace(/\[!m:\$(.*?)\$\]/g, "___MATH_TOKEN___$1___END___");
+  x = x.replace(/\[!img:\$(.*?)\$\]/g, "___IMG_TOKEN___$1___END___");
 
-  // Nhưng token [!m:$...$] / [!img:$...$] đang nằm ngoài w:t, nên phải giữ chúng:
-  // -> Trick: trước khi remove tag, ta replace token vào marker riêng rồi strip.
-  // Ở trên token vẫn còn trong `x`, nhưng nếu chỉ join w:t sẽ mất token.
-  // Vì vậy cách chắc nhất: strip tag nhưng CHỪA token.
-
-  // Bọc token bằng placeholder không có dấu <>
-  x = x.replace(/\[!m:\$(.*?)\$\]/g, "___MATH_TOKEN_START___$1___MATH_TOKEN_END___");
-  x = x.replace(/\[!img:\$(.*?)\$\]/g, "___IMG_TOKEN_START___$1___IMG_TOKEN_END___");
-
-  // Thay w:t bằng content để giữ cả token lẫn text
+  // Replace <w:t>...</w:t> with inner text
   x = x.replace(/<w:t\b[^>]*>[\s\S]*?<\/w:t>/g, (seg) => {
     const mm = seg.match(/<w:t\b[^>]*>([\s\S]*?)<\/w:t>/);
     return mm ? mm[1] : "";
   });
 
-  // Xóa toàn bộ tag còn lại
+  // Strip remaining tags
   x = x.replace(/<[^>]+>/g, "");
 
-  // Khôi phục token
+  // Restore tokens
   x = x
-    .replace(/___MATH_TOKEN_START___(.*?)___MATH_TOKEN_END___/g, "[!m:$$$1$$]")
-    .replace(/___IMG_TOKEN_START___(.*?)___IMG_TOKEN_END___/g, "[!img:$$$1$$]");
+    .replace(/___MATH_TOKEN___(.*?)___END___/g, "[!m:$$$1$$]")
+    .replace(/___IMG_TOKEN___(.*?)___END___/g, "[!img:$$$1$$]");
 
-  // Decode entity + normalize whitespace vừa phải
   x = decodeXmlEntities(x)
     .replace(/\r/g, "")
     .replace(/[ \t]+\n/g, "\n")
@@ -266,7 +253,6 @@ function wordXmlToTextKeepTokens(docXml) {
 }
 
 function parseQuestions(text) {
-  // bạn đang format kiểu: "Câu 1." "A." ...
   const blocks = text.split(/(?=Câu\s+\d+\.)/);
   const questions = [];
 
@@ -284,8 +270,6 @@ function parseQuestions(text) {
     const [main, solution] = block.split(/Lời giải/i);
     q.solution = solution ? solution.trim() : "";
 
-    // NOTE: regex choices có thể gặp trường hợp nội dung chứa "A." trong text.
-    // Mình giữ gần giống bạn, nhưng an toàn hơn bằng cách chặn tới (B.|C.|D.|Lời giải|$)
     const choiceRe = /(\*?)([A-D])\.\s([\s\S]*?)(?=\n\*?[A-D]\.\s|\nLời giải|$)/g;
     let m;
     while ((m = choiceRe.exec(main))) {
@@ -296,7 +280,6 @@ function parseQuestions(text) {
       q.choices.push({ label, text: content });
     }
 
-    // content = phần trước lựa chọn đầu tiên
     const splitAtA = main.split(/\n\*?A\.\s/);
     q.content = splitAtA[0].trim();
     questions.push(q);
@@ -312,36 +295,40 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     const zip = await unzipper.Open.buffer(req.file.buffer);
 
     const docEntry = zip.files.find((f) => f.path === "word/document.xml");
-    const relEntry = zip.files.find((f) => f.path === "word/_rels/document.xml.rels");
-    if (!docEntry || !relEntry) throw new Error("Missing document.xml or document.xml.rels");
+    const relEntry = zip.files.find(
+      (f) => f.path === "word/_rels/document.xml.rels"
+    );
+    if (!docEntry || !relEntry)
+      throw new Error("Missing document.xml or document.xml.rels");
 
     let docXml = (await docEntry.buffer()).toString("utf8");
     const relsXml = (await relEntry.buffer()).toString("utf8");
     const rels = parseRels(relsXml);
 
-    // A) Ảnh (drawing/vml) -> token [!img:$img_x$]
-    const imgTok = await tokenizeImages(docXml, rels, zip.files);
-    docXml = imgTok.outXml;
-    const imgMap = imgTok.imgMap;
-
-    // B) MathType OLE -> token [!m:$mathtype_x$] (+ fallback ảnh nếu cần)
-    const mathTok = await tokenizeMathTypeOle(docXml, rels, zip.files, imgMap);
+    // ✅ IMPORTANT: MathType FIRST so preview rid is still inside <w:object>
+    const images = {};
+    const mathTok = await tokenizeMathTypeOleFirst(docXml, rels, zip.files, images);
     docXml = mathTok.outXml;
     const mathMap = mathTok.mathMap;
 
-    // C) XML -> text giữ token
+    // Then tokenize remaining images
+    const imgTok = await tokenizeImagesAfter(docXml, rels, zip.files);
+    docXml = imgTok.outXml;
+    Object.assign(images, imgTok.imgMap);
+
+    // XML -> text keep tokens
     const text = wordXmlToTextKeepTokens(docXml);
 
-    // D) parse câu hỏi
+    // Parse quiz blocks
     const questions = parseQuestions(text);
 
     res.json({
       ok: true,
       total: questions.length,
       questions,
-      math: mathMap,  // mathtype_x -> "<math ...>...</math>"
-      images: imgMap, // img_x -> dataURL ; fallback_mathtype_x -> dataURL
-      rawText: text,  // debug nếu cần
+      math: mathMap,
+      images,
+      rawText: text, // debug nếu cần
     });
   } catch (err) {
     console.error(err);
