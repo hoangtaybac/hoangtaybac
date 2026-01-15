@@ -52,7 +52,7 @@ function guessMimeFromFilename(filename = "") {
 }
 
 function decodeXmlEntities(s = "") {
-  return String(s)
+  return s
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
     .replace(/&amp;/g, "&")
@@ -113,13 +113,17 @@ async function maybeConvertEmfWmfToPng(buf, filename) {
 
 /* ================= MathML -> LaTeX Helpers (IMPROVED) ================= */
 
-/** Ensure MathML has namespace */
+/**
+ * Ensure MathML has namespace (some converters fail if <math> lacks xmlns)
+ */
 function ensureMathMLNamespace(mathml) {
   if (!mathml) return mathml;
   let s = String(mathml);
 
+  // remove XML header if any
   s = s.replace(/<\?xml[^>]*\?>/gi, "").trim();
 
+  // add MathML namespace if missing
   s = s.replace(
     /<math(?![^>]*\bxmlns=)/i,
     '<math xmlns="http://www.w3.org/1998/Math/MathML"'
@@ -128,118 +132,73 @@ function ensureMathMLNamespace(mathml) {
   return s;
 }
 
-/** Normalize <mtable ...> -> <mtable> */
+/**
+ * Normalize <mtable ...> -> <mtable> to avoid libraries outputting raw \\ without array/matrix
+ */
 function normalizeMtable(mathml) {
   if (!mathml) return mathml;
   return String(mathml).replace(/<mtable\b[^>]*>/gi, "<mtable>");
 }
 
 /**
- * ✅ FIX CĂN:
- * - decode entity trước
- * - bắt được <mo ...>√</mo> có attributes (stretchy="false"...)
- * - wrap nhiều pattern √ + node tiếp theo
+ * Pre-process MathML to ensure sqrt elements are properly formatted
  */
 function preprocessMathMLForSqrt(mathml) {
   if (!mathml) return mathml;
+  let s = String(mathml);
 
-  // IMPORTANT: decode entities first (handles &amp;#x221A; etc.)
-  let s = decodeXmlEntities(String(mathml));
+  const moSqrt = String.raw`<mo>\s*(?:√|&#8730;|&#x221a;|&#x221A;|&radic;)\s*<\/mo>`;
 
-  // Match <mo ...> √ </mo> WITH optional attributes
-  const moSqrt =
-    String.raw`<mo\b[^>]*>\s*(?:√|&#8730;|&#x221a;|&#x221A;|&radic;)\s*<\/mo>`;
-
-  // √ + <mrow>...</mrow>
   s = s.replace(
     new RegExp(moSqrt + String.raw`\s*<mrow>([\s\S]*?)<\/mrow>`, "gi"),
     "<msqrt>$1</msqrt>"
   );
-
-  // √ + <mi>...</mi>
   s = s.replace(
-    new RegExp(moSqrt + String.raw`\s*<mi\b[^>]*>([\s\S]*?)<\/mi>`, "gi"),
+    new RegExp(moSqrt + String.raw`\s*<mi>([^<]+)<\/mi>`, "gi"),
     "<msqrt><mi>$1</mi></msqrt>"
   );
-
-  // √ + <mn>...</mn>
   s = s.replace(
-    new RegExp(moSqrt + String.raw`\s*<mn\b[^>]*>([\s\S]*?)<\/mn>`, "gi"),
+    new RegExp(moSqrt + String.raw`\s*<mn>([^<]+)<\/mn>`, "gi"),
     "<msqrt><mn>$1</mn></msqrt>"
   );
-
-  // √ + <mfenced ...>...</mfenced>
   s = s.replace(
-    new RegExp(
-      moSqrt + String.raw`\s*<mfenced\b([^>]*)>([\s\S]*?)<\/mfenced>`,
-      "gi"
-    ),
+    new RegExp(moSqrt + String.raw`\s*<mfenced([^>]*)>([\s\S]*?)<\/mfenced>`, "gi"),
     "<msqrt><mfenced$1>$2</mfenced></msqrt>"
-  );
-
-  // √ + node bất kỳ (mfrac/msub/msup/msubsup/...)
-  s = s.replace(
-    new RegExp(
-      moSqrt +
-        String.raw`\s*(<(?:mfrac|msub|msup|msubsup|mover|munder|munderover|mmultiscripts|mtext|mstyle|mpadded|mphantom|msqrt|mroot|mfenced|mi|mn)\b[\s\S]*?<\/(?:mfrac|msub|msup|msubsup|mover|munder|munderover|mmultiscripts|mtext|mstyle|mpadded|mphantom|msqrt|mroot|mfenced|mi|mn)>)`,
-      "gi"
-    ),
-    "<msqrt>$1</msqrt>"
   );
 
   return s;
 }
 
-/** Post-process LaTeX to fix sqrt issues and other artifacts */
+/**
+ * Post-process LaTeX to fix sqrt issues and other artifacts
+ */
 function postprocessLatexSqrt(latex) {
   if (!latex) return latex;
   let s = String(latex);
 
-  // library sometimes emits \surd
   s = s.replace(/\\surd\b/g, "\\sqrt{}");
 
-  // handle unicode √ forms
   s = s.replace(/√\s*\{([^}]+)\}/g, "\\sqrt{$1}");
   s = s.replace(/√\s*\(([^)]+)\)/g, "\\sqrt{$1}");
   s = s.replace(/√\s*(\d+)/g, "\\sqrt{$1}");
   s = s.replace(/√\s*([a-zA-Z])/g, "\\sqrt{$1}");
 
-  // handle \sqrt x or \sqrt 2 => \sqrt{x}
   s = s.replace(/\\sqrt\s+(\d+)(?![}\d])/g, "\\sqrt{$1}");
   s = s.replace(/\\sqrt\s+([a-zA-Z])(?![}\w])/g, "\\sqrt{$1}");
 
-  // \sqrt{} empty -> phantom
   s = s.replace(/\\sqrt\s*\{\s*\}/g, "\\sqrt{\\phantom{x}}");
 
-  // \sqrt { -> \sqrt{
   s = s.replace(/\\sqrt\s+\{/g, "\\sqrt{");
 
-  // \root{n}\of{a} -> \sqrt[n]{a}
   s = s.replace(/\\root\s*\{([^}]+)\}\s*\\of\s*\{([^}]+)\}/g, "\\sqrt[$1]{$2}");
   s = s.replace(/\\sqrt\s*\[\s*(\d+)\s*\]\s*\{/g, "\\sqrt[$1]{");
-
-  // ✅ FIX: \sqrt\left(...\right) => \sqrt{\left(...\right)}
-  s = s.replace(
-    /\\sqrt\s*\\left\(([\s\S]*?)\\right\)/g,
-    "\\\\sqrt{\\\\left($1\\\\right)}"
-  );
-  s = s.replace(
-    /\\sqrt\s*\\left\[([\s\S]*?)\\right\]/g,
-    "\\\\sqrt{\\\\left[$1\\\\right]}"
-  );
-  s = s.replace(
-    /\\sqrt\s*\\left\{([\s\S]*?)\\right\}/g,
-    "\\\\sqrt{\\\\left\\{$1\\\\right\\}}"
-  );
-  s = s.replace(
-    /\\sqrt\s*\\left\|([\s\S]*?)\\right\|/g,
-    "\\\\sqrt{\\\\left|$1\\\\right|}"
-  );
 
   return s;
 }
 
-/** Final LaTeX cleanup */
+/**
+ * Final LaTeX cleanup: Unicode, malformed fences, spaced functions
+ */
 function finalLatexCleanup(latex) {
   if (!latex) return latex;
   let s = String(latex);
@@ -274,7 +233,9 @@ function finalLatexCleanup(latex) {
   return s;
 }
 
-/** Manual MathML -> LaTeX fallback */
+/**
+ * Manual MathML -> LaTeX fallback (handles msqrt/mroot/mfrac etc)
+ */
 function manualMathMLToLatex(mathml) {
   if (!mathml) return "";
 
@@ -298,9 +259,13 @@ function manualMathMLToLatex(mathml) {
     if (typeof node === "string") return node;
     if (typeof node === "number") return String(node);
 
-    if (node["#text"] !== undefined) return String(node["#text"]);
+    if (node["#text"] !== undefined) {
+      return String(node["#text"]);
+    }
 
-    if (Array.isArray(node)) return node.map(nodeToLatex).join("");
+    if (Array.isArray(node)) {
+      return node.map(nodeToLatex).join("");
+    }
 
     let result = "";
 
@@ -454,6 +419,7 @@ function manualMathMLToLatex(mathml) {
 
   let latex = nodeToLatex(parsed);
 
+  // Clean up matrix separators
   latex = latex.replace(/\s*&\s*\\\\/g, " \\\\");
   latex = latex.replace(/\s*&\s*$/g, "");
   latex = latex.replace(/\s+/g, " ").trim();
@@ -461,7 +427,9 @@ function manualMathMLToLatex(mathml) {
   return latex;
 }
 
-/** Try library then fallback to manual, with preprocessing/postprocessing */
+/**
+ * Try library then fallback to manual, with preprocessing/postprocessing
+ */
 function customMathMLToLatex(mathml) {
   if (!mathml) return "";
 
@@ -472,11 +440,13 @@ function customMathMLToLatex(mathml) {
   let latex = "";
   try {
     latex = MathMLToLaTeX.convert(mm) || "";
-  } catch {
+  } catch (e) {
     latex = "";
   }
 
-  if (!latex) latex = manualMathMLToLatex(mm) || "";
+  if (!latex) {
+    latex = manualMathMLToLatex(mm) || "";
+  }
 
   latex = postprocessLatexSqrt(latex);
   latex = finalLatexCleanup(latex);
@@ -495,8 +465,12 @@ function mathmlToLatexSafe(mml) {
 
 /* ================= MathType OLE -> MathML -> LaTeX ================= */
 
-/** scan MathML embedded directly in OLE */
+/**
+ * scan MathML embedded directly in OLE (nhanh)
+ * - supports raw <math> (utf8/utf16le) and escaped &lt;math...&lt;/math&gt;
+ */
 function extractMathMLFromOleScan(buf) {
+  // Try raw utf8
   try {
     const utf8 = buf.toString("utf8");
     let i = utf8.indexOf("<math");
@@ -505,10 +479,16 @@ function extractMathMLFromOleScan(buf) {
       if (j !== -1) return utf8.slice(i, j + 7);
     }
 
+    // Try escaped math: &lt;math ... &lt;/math&gt;
     const escMatch = utf8.match(/(&lt;math[\s\S]*?&lt;\/math&gt;)/i);
-    if (escMatch) return decodeXmlEntities(escMatch[1]);
-  } catch {}
+    if (escMatch) {
+      return decodeXmlEntities(escMatch[1]);
+    }
+  } catch (err) {
+    // ignore
+  }
 
+  // Try utf16le
   try {
     const u16 = buf.toString("utf16le");
     let i2 = u16.indexOf("<math");
@@ -518,13 +498,20 @@ function extractMathMLFromOleScan(buf) {
     }
 
     const escMatch2 = u16.match(/(&lt;math[\s\S]*?&lt;\/math&gt;)/i);
-    if (escMatch2) return decodeXmlEntities(escMatch2[1]);
-  } catch {}
+    if (escMatch2) {
+      return decodeXmlEntities(escMatch2[1]);
+    }
+  } catch (err) {
+    // ignore
+  }
 
   return null;
 }
 
-/** fallback ruby mt2mml */
+/**
+ * fallback: call ruby mt2mml.rb or mt2mml_v2.rb ole.bin -> MathML
+ * - If v2 returns JSON { mathml: "..." } parse and return mathml
+ */
 function rubyOleToMathML(oleBuf) {
   return new Promise((resolve, reject) => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ole-"));
@@ -543,16 +530,22 @@ function rubyOleToMathML(oleBuf) {
         try {
           fs.rmSync(tmpDir, { recursive: true, force: true });
         } catch {}
-
         const outStr = String(stdout || "").trim();
 
-        if (err && !outStr) return reject(new Error(stderr || err.message));
+        if (err && !outStr) {
+          return reject(new Error(stderr || err.message));
+        }
 
+        // If v2 returns JSON like { mathml: "...", error: ... }
         if (outStr) {
           try {
             const parsed = JSON.parse(outStr);
-            if (parsed && parsed.mathml) return resolve(String(parsed.mathml || "").trim());
-          } catch {}
+            if (parsed && parsed.mathml) {
+              return resolve(String(parsed.mathml || "").trim());
+            }
+          } catch (jsonErr) {
+            // not JSON, continue
+          }
         }
 
         resolve(outStr);
@@ -561,7 +554,16 @@ function rubyOleToMathML(oleBuf) {
   });
 }
 
-/** MathType FIRST */
+/**
+ * MathType FIRST:
+ * - token [!m:$mathtype_x$]
+ * - produce:
+ *   latexMap[key] = "..."
+ *   (optional) images["fallback_key"] = png dataURL if latex fails
+ *
+ * NOTE: giữ nguyên thuật toán, chỉ dùng mathmlToLatexSafe (mạnh hơn) khi chuyển MathML -> LaTeX
+ *       và trả về mathmlMap để debug.
+ */
 async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
   let idx = 0;
   const found = {}; // key -> { oleTarget, previewRid }
@@ -593,9 +595,11 @@ async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
       const oleFull = normalizeTargetToWordPath(info.oleTarget);
       const oleBuf = await getZipEntryBuffer(zipFiles, oleFull);
 
+      // 1) try scan MathML inside OLE
       let mml = "";
       if (oleBuf) mml = extractMathMLFromOleScan(oleBuf) || "";
 
+      // 2) fallback ruby convert (MTEF inside OLE)
       if (!mml && oleBuf) {
         try {
           mml = await rubyOleToMathML(oleBuf);
@@ -604,14 +608,19 @@ async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
         }
       }
 
-      if (mml) mathmlMap[key] = mml;
+      if (mml) {
+        // store original MathML (for debugging)
+        mathmlMap[key] = mml;
+      }
 
+      // 3) MathML -> LaTeX (IMPROVED)
       const latex = mml ? mathmlToLatexSafe(mml) : "";
       if (latex) {
         latexMap[key] = latex;
         return;
       }
 
+      // 4) If no latex, fallback to preview image (convert emf/wmf->png)
       if (info.previewRid) {
         const t = rels.get(info.previewRid);
         if (t) {
@@ -643,7 +652,9 @@ async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
   return { outXml: docXml, latexMap, mathmlMap };
 }
 
-/** Tokenize normal images AFTER MathType */
+/**
+ * Tokenize normal images AFTER MathType (and convert EMF/WMF -> PNG if possible)
+ */
 async function tokenizeImagesAfter(docXml, rels, zipFiles) {
   let idx = 0;
   const imgMap = {};
@@ -697,38 +708,51 @@ async function tokenizeImagesAfter(docXml, rels, zipFiles) {
 }
 
 /* ================= Text & Questions ================= */
-
+/**
+ * ✅ HOÀN THIỆN:
+ * - GIỮ token [!m:$...$]/[!img:$...$] để HTML render công thức + ảnh
+ * - GIỮ underline bằng <u>...</u>
+ * - Không đổi thuật toán MathType/LaTeX phía trên
+ */
 function wordXmlToTextKeepTokens(docXml) {
   let x = docXml
     .replace(/<w:tab\s*\/>/g, "\t")
     .replace(/<w:br\s*\/>/g, "\n")
     .replace(/<\/w:p>/g, "\n");
 
+  // 1) Protect tokens BEFORE stripping tags (both $key$ and $$key$$)
   x = x.replace(/\[!m:\$\$?(.*?)\$\$?\]/g, "___MATH_TOKEN___$1___END___");
   x = x.replace(/\[!img:\$\$?(.*?)\$\$?\]/g, "___IMG_TOKEN___$1___END___");
 
+  // 2) Convert each run <w:r> while preserving underline + token text
   x = x.replace(/<w:r\b[\s\S]*?<\/w:r>/g, (run) => {
     const hasU =
       /<w:u\b[^>]*\/>/.test(run) &&
       !/<w:u\b[^>]*w:val="none"[^>]*\/>/.test(run);
 
+    // remove run properties but keep content (tokens are plain text)
     let inner = run.replace(/<w:rPr\b[\s\S]*?<\/w:rPr>/g, "");
 
+    // w:t -> raw text
     inner = inner.replace(/<w:t\b[^>]*>([\s\S]*?)<\/w:t>/g, (_, t) => t ?? "");
 
+    // optional instrText
     inner = inner.replace(
       /<w:instrText\b[^>]*>([\s\S]*?)<\/w:instrText>/g,
       (_, t) => t ?? ""
     );
 
+    // remove remaining tags inside run
     inner = inner.replace(/<[^>]+>/g, "");
 
     if (!inner) return "";
     return hasU ? `<u>${inner}</u>` : inner;
   });
 
+  // 3) Remove remaining tags outside runs, but keep <u>
   x = x.replace(/<(?!\/?u\b)[^>]+>/g, "");
 
+  // 4) Restore tokens in a stable form (use $$ ... $$)
   x = x
     .replace(/___MATH_TOKEN___(.*?)___END___/g, "[!m:$$$1$$]")
     .replace(/___IMG_TOKEN___(.*?)___END___/g, "[!img:$$$1$$]");
@@ -760,6 +784,7 @@ function parseQuestions(text) {
     const [main, solution] = block.split(/Lời giải/i);
     q.solution = solution ? solution.trim() : "";
 
+    // ✅ giữ nguyên thuật toán parse đáp án của bạn
     const choiceRe =
       /(\*?)([A-D])\.\s([\s\S]*?)(?=\n\*?[A-D]\.\s|\nLời giải|$)/g;
 
@@ -780,8 +805,12 @@ function parseQuestions(text) {
   return questions;
 }
 
-/* ================= Section extraction ================= */
+/* ================= Section extraction (non-intrusive) ================= */
 
+/**
+ * Extract simple "PHẦN ..." or "PHẦN X." style headers from document.xml
+ * This is non-invasive: chỉ đọc documentXml để trả về sections array, không thay đổi tokenization/parsing.
+ */
 function extractSectionsFromDocXml(docXml) {
   if (!docXml) return [];
   const re = /<w:t[^>]*>([^<]*?(?:PHẦN|Phần|PHAN|Phần)\s*\d[^<]*)<\/w:t>/gi;
@@ -791,7 +820,8 @@ function extractSectionsFromDocXml(docXml) {
     const txt = decodeXmlEntities(m[1].trim());
     out.push({ title: txt });
   }
-  return [...new Map(out.map((s) => [s.title, s])).values()];
+  // unique
+  return [...new Map(out.map(s => [s.title, s])).values()];
 }
 
 /* ================= API ================= */
@@ -813,28 +843,26 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     const relsXml = (await relEntry.buffer()).toString("utf8");
     const rels = parseRels(relsXml);
 
-    // 1) MathType
+    // 1) MathType -> LaTeX (and fallback images) ✅ giữ nguyên thuật toán
     const images = {};
     const mt = await tokenizeMathTypeOleFirst(docXml, rels, zip.files, images);
     docXml = mt.outXml;
     const latexMap = mt.latexMap;
     const mathmlMap = mt.mathmlMap || {};
 
-    // 2) normal images
+    // 2) normal images ✅ giữ nguyên
     const imgTok = await tokenizeImagesAfter(docXml, rels, zip.files);
     docXml = imgTok.outXml;
     Object.assign(images, imgTok.imgMap);
 
-    // 3) text keep tokens + underline
+    // 3) text ✅ giờ giữ token + underline
     const text = wordXmlToTextKeepTokens(docXml);
 
-    // 4) parse questions
+    // 4) parse questions ✅ giữ nguyên
     const questions = parseQuestions(text);
 
-    // 5) sections
-    const sections = extractSectionsFromDocXml(
-      (await docEntry.buffer()).toString("utf8")
-    );
+    // 5) extract sections (không thay đổi thuật toán chính)
+    const sections = extractSectionsFromDocXml((await docEntry.buffer()).toString("utf8"));
 
     res.json({
       ok: true,
@@ -843,8 +871,8 @@ app.post("/upload", upload.single("file"), async (req, res) => {
       latex: latexMap,
       images,
       rawText: text,
-      sections,
-      mathml: mathmlMap,
+      sections, // bổ sung thông tin tiêu đề phần (nếu có)
+      mathml: mathmlMap // gốc để debug (token -> MathML)
     });
   } catch (err) {
     console.error(err);
