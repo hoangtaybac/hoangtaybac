@@ -157,11 +157,89 @@ function rubyOleToMathML(oleBuf) {
   });
 }
 
+/**
+ * Normalize OMML radical tags to MathML equivalents.
+ *
+ * This is a lightweight, heuristic transform:
+ * - <m:rad> ... <m:deg>index</m:deg> <m:e>base</m:e> </m:rad>  --> <mroot>base index</mroot>
+ * - <m:rad> ... <m:e>base</m:e> </m:rad>  --> <msqrt>base</msqrt>
+ *
+ * It also attempts to handle tags without the "m:" prefix.
+ *
+ * Note: This is intentionally conservative — it does string-based transforms
+ * to improve convertibility to MathML -> LaTeX without changing the main algorithm.
+ */
+function normalizeRadicalsInMathML(mml) {
+  if (!mml || typeof mml !== "string") return mml;
+
+  let s = mml;
+
+  // Handle <m:rad> ... </m:rad>
+  s = s.replace(/<m:rad\b[^>]*>([\s\S]*?)<\/m:rad>/gi, (full, inner) => {
+    // try to extract <m:e> and optional <m:deg>
+    const eMatch = inner.match(/<m:e\b[^>]*>([\s\S]*?)<\/m:e>/i);
+    const degMatch = inner.match(/<m:deg\b[^>]*>([\s\S]*?)<\/m:deg>/i);
+    const e = eMatch ? eMatch[1] : "";
+    const deg = degMatch ? degMatch[1] : "";
+
+    if (deg && deg.trim()) {
+      return `<mroot>${e}${deg}</mroot>`;
+    }
+    return `<msqrt>${e}</msqrt>`;
+  });
+
+  // Handle <rad> ... </rad> (without prefix)
+  s = s.replace(/<rad\b[^>]*>([\s\S]*?)<\/rad>/gi, (full, inner) => {
+    const eMatch = inner.match(/<e\b[^>]*>([\s\S]*?)<\/e>/i);
+    const degMatch = inner.match(/<deg\b[^>]*>([\s\S]*?)<\/deg>/i);
+    const e = eMatch ? eMatch[1] : "";
+    const deg = degMatch ? degMatch[1] : "";
+
+    if (deg && deg.trim()) {
+      return `<mroot>${e}${deg}</mroot>`;
+    }
+    return `<msqrt>${e}</msqrt>`;
+  });
+
+  // Optional: remove m: prefixes for common OMML nodes that may trip the converter,
+  // but be conservative (only for tags often present in OMML that we've touched).
+  // This helps if convert expects plain MathML tags like <msqrt>.
+  s = s
+    .replace(/<m:msqrt/gi, "<msqrt")
+    .replace(/<\/m:msqrt/gi, "</msqrt")
+    .replace(/<m:mroot/gi, "<mroot")
+    .replace(/<\/m:mroot/gi, "</mroot")
+    .replace(/<m:math/gi, "<math")
+    .replace(/<\/m:math/gi, "</math")
+    .replace(/<m:mn/gi, "<mn")
+    .replace(/<\/m:mn/gi, "</mn")
+    .replace(/<m:mi/gi, "<mi")
+    .replace(/<\/m:mi/gi, "</mi")
+    .replace(/<m:mo/gi, "<mo")
+    .replace(/<\/m:mo/gi, "</mo");
+
+  return s;
+}
+
 function mathmlToLatexSafe(mml) {
   try {
     if (!mml || !mml.includes("<math")) return "";
+    // First try: as-is
     const latex = MathMLToLaTeX.convert(mml);
-    return (latex || "").trim();
+    if (latex && String(latex).trim()) return (latex || "").trim();
+
+    // Fallback: try to normalize OMML-style radicals into MathML and convert again
+    const normalized = normalizeRadicalsInMathML(mml);
+    if (normalized !== mml) {
+      try {
+        const latex2 = MathMLToLaTeX.convert(normalized);
+        if (latex2 && String(latex2).trim()) return (latex2 || "").trim();
+      } catch {
+        // ignore and fall through
+      }
+    }
+
+    return "";
   } catch {
     return "";
   }
