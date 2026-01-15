@@ -374,6 +374,18 @@ app.post("/upload", upload.single("file"), async (req, res) => {
 });
 
 app.get("/ping", (_, res) => res.send("ok"));
+// THÊM Ở ĐÂY
+import { execFileSync } from "child_process";
+
+app.get("/debug-inkscape", (_, res) => {
+  try {
+    const v = execFileSync("inkscape", ["--version"]).toString();
+    res.type("text/plain").send(v);
+  } catch (e) {
+    res.status(500).type("text/plain").send("NO INKSCAPE");
+  }
+});
+///HẾT THÊM 
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("🚀 Server running on", PORT));
