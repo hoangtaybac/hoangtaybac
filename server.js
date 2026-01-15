@@ -467,27 +467,50 @@ function mathmlToLatexSafe(mml) {
 
 /**
  * scan MathML embedded directly in OLE (nhanh)
+ * - supports raw <math> (utf8/utf16le) and escaped &lt;math...&lt;/math&gt;
  */
 function extractMathMLFromOleScan(buf) {
-  const utf8 = buf.toString("utf8");
-  let i = utf8.indexOf("<math");
-  if (i !== -1) {
-    let j = utf8.indexOf("</math>", i);
-    if (j !== -1) return utf8.slice(i, j + 7);
+  // Try raw utf8
+  try {
+    const utf8 = buf.toString("utf8");
+    let i = utf8.indexOf("<math");
+    if (i !== -1) {
+      let j = utf8.indexOf("</math>", i);
+      if (j !== -1) return utf8.slice(i, j + 7);
+    }
+
+    // Try escaped math: &lt;math ... &lt;/math&gt;
+    const escMatch = utf8.match(/(&lt;math[\s\S]*?&lt;\/math&gt;)/i);
+    if (escMatch) {
+      return decodeXmlEntities(escMatch[1]);
+    }
+  } catch (err) {
+    // ignore
   }
 
-  const u16 = buf.toString("utf16le");
-  i = u16.indexOf("<math");
-  if (i !== -1) {
-    let j = u16.indexOf("</math>", i);
-    if (j !== -1) return u16.slice(i, j + 7);
+  // Try utf16le
+  try {
+    const u16 = buf.toString("utf16le");
+    let i2 = u16.indexOf("<math");
+    if (i2 !== -1) {
+      let j2 = u16.indexOf("</math>", i2);
+      if (j2 !== -1) return u16.slice(i2, j2 + 7);
+    }
+
+    const escMatch2 = u16.match(/(&lt;math[\s\S]*?&lt;\/math&gt;)/i);
+    if (escMatch2) {
+      return decodeXmlEntities(escMatch2[1]);
+    }
+  } catch (err) {
+    // ignore
   }
 
   return null;
 }
 
 /**
- * fallback: call ruby mt2mml.rb ole.bin -> MathML
+ * fallback: call ruby mt2mml.rb or mt2mml_v2.rb ole.bin -> MathML
+ * - If v2 returns JSON { mathml: "..." } parse and return mathml
  */
 function rubyOleToMathML(oleBuf) {
   return new Promise((resolve, reject) => {
@@ -495,16 +518,37 @@ function rubyOleToMathML(oleBuf) {
     const inPath = path.join(tmpDir, "oleObject.bin");
     fs.writeFileSync(inPath, oleBuf);
 
+    const v2Script = path.join(process.cwd(), "mt2mml_v2.rb");
+    const v1Script = path.join(process.cwd(), "mt2mml.rb");
+    const scriptToUse = fs.existsSync(v2Script) ? v2Script : v1Script;
+
     execFile(
       "ruby",
-      ["mt2mml.rb", inPath],
-      { timeout: 30000, maxBuffer: 20 * 1024 * 1024 },
+      [scriptToUse, inPath],
+      { timeout: 30000, maxBuffer: 40 * 1024 * 1024 },
       (err, stdout, stderr) => {
         try {
           fs.rmSync(tmpDir, { recursive: true, force: true });
         } catch {}
-        if (err) return reject(new Error(stderr || err.message));
-        resolve(String(stdout || "").trim());
+        const outStr = String(stdout || "").trim();
+
+        if (err && !outStr) {
+          return reject(new Error(stderr || err.message));
+        }
+
+        // If v2 returns JSON like { mathml: "...", error: ... }
+        if (outStr) {
+          try {
+            const parsed = JSON.parse(outStr);
+            if (parsed && parsed.mathml) {
+              return resolve(String(parsed.mathml || "").trim());
+            }
+          } catch (jsonErr) {
+            // not JSON, continue
+          }
+        }
+
+        resolve(outStr);
       }
     );
   });
@@ -518,6 +562,7 @@ function rubyOleToMathML(oleBuf) {
  *   (optional) images["fallback_key"] = png dataURL if latex fails
  *
  * NOTE: giữ nguyên thuật toán, chỉ dùng mathmlToLatexSafe (mạnh hơn) khi chuyển MathML -> LaTeX
+ *       và trả về mathmlMap để debug.
  */
 async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
   let idx = 0;
@@ -543,6 +588,7 @@ async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
   });
 
   const latexMap = {};
+  const mathmlMap = {};
 
   await Promise.all(
     Object.entries(found).map(async ([key, info]) => {
@@ -560,6 +606,11 @@ async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
         } catch {
           mml = "";
         }
+      }
+
+      if (mml) {
+        // store original MathML (for debugging)
+        mathmlMap[key] = mml;
       }
 
       // 3) MathML -> LaTeX (IMPROVED)
@@ -598,7 +649,7 @@ async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
     })
   );
 
-  return { outXml: docXml, latexMap };
+  return { outXml: docXml, latexMap, mathmlMap };
 }
 
 /**
@@ -797,6 +848,7 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     const mt = await tokenizeMathTypeOleFirst(docXml, rels, zip.files, images);
     docXml = mt.outXml;
     const latexMap = mt.latexMap;
+    const mathmlMap = mt.mathmlMap || {};
 
     // 2) normal images ✅ giữ nguyên
     const imgTok = await tokenizeImagesAfter(docXml, rels, zip.files);
@@ -820,6 +872,7 @@ app.post("/upload", upload.single("file"), async (req, res) => {
       images,
       rawText: text,
       sections, // bổ sung thông tin tiêu đề phần (nếu có)
+      mathml: mathmlMap // gốc để debug (token -> MathML)
     });
   } catch (err) {
     console.error(err);
