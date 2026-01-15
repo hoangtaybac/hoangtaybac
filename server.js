@@ -157,11 +157,189 @@ function rubyOleToMathML(oleBuf) {
   });
 }
 
+/* ================== LATEX POSTPROCESS (GHÉP XỬ LÝ CĂN + CASES) ================== */
+
+const SQRT_MATHML_RE = /(msqrt|mroot|√|&#8730;|&#x221a;|&#x221A;|&radic;)/i;
+
+function sanitizeLatexStrict(latex) {
+  if (!latex) return latex;
+  latex = String(latex).replace(/\s+/g, " ").trim();
+
+  latex = latex
+    .replace(
+      /\\left(?!\s*(\(|\[|\\\{|\\langle|\\vert|\\\||\||\.))/g,
+      ""
+    )
+    .replace(
+      /\\right(?!\s*(\)|\]|\\\}|\\rangle|\\vert|\\\||\||\.))/g,
+      ""
+    );
+
+  const tokens = latex.match(/\\left\b|\\right\b/g) || [];
+  let bal = 0;
+  let broken = false;
+  for (const t of tokens) {
+    if (t === "\\left") bal++;
+    else {
+      if (bal === 0) {
+        broken = true;
+        break;
+      }
+      bal--;
+    }
+  }
+  if (bal !== 0) broken = true;
+
+  if (broken) latex = latex.replace(/\\left\s*/g, "").replace(/\\right\s*/g, "");
+  return latex;
+}
+
+function fixSetBracesHard(latex) {
+  let s = String(latex || "");
+
+  s = s.replace(
+    /\\underset\s*\{([^}]*)\}\s*\{\s*l\s*i\s*m\s*\}/gi,
+    "\\underset{$1}{\\lim}"
+  );
+  s = s.replace(/\b(l)\s+(i)\s+(m)\b/gi, "lim");
+  s = s.replace(/(^|[^A-Za-z\\])lim([^A-Za-z]|$)/g, "$1\\lim$2");
+
+  s = s.replace(/\\arrow\b/g, "\\rightarrow");
+  s = s.replace(/\bxarrow\b/g, "x\\rightarrow");
+  s = s.replace(/\\xarrow\b/g, "\\xrightarrow");
+
+  s = s.replace(/\\\{\s*\./g, "\\{");
+  s = s.replace(/\.\s*\\\}/g, "\\}");
+  s = s.replace(/\\\}\s*\./g, "\\}");
+
+  s = s.replace(/\\mathbb\{([A-Za-z])\\\}/g, "\\mathbb{$1}");
+  s = s.replace(/\\mathbb\{([A-Za-z])\}\s*\.\s*\}/g, "\\mathbb{$1}}");
+
+  s = s.replace(/\\backslash\s*{(?!\\)/g, "\\backslash \\{");
+  s = s.replace(/\\setminus\s*{(?!\\)/g, "\\setminus \\{");
+
+  if (
+    (s.includes("\\backslash \\{") || s.includes("\\setminus \\{")) &&
+    !s.includes("\\}")
+  ) {
+    s = s.replace(/\}\s*$/g, "").trim() + "\\}";
+  }
+
+  s = s.replace(/\\\}\s*([,.;:])/g, "\\}$1");
+
+  s = s.replace(/\\frac\{([^}]*)\}\{([^}]*)\}/g, (m, a, b) => {
+    const bb = String(b).replace(/(\d)\s+(\d)/g, "$1$2");
+    return `\\frac{${a}}{${bb}}`;
+  });
+
+  s = s.replace(/\s+/g, " ").trim();
+  return s;
+}
+
+function restoreArrowAndCoreCommands(latex) {
+  let s = String(latex || "");
+  s = s.replace(/\s+/g, " ").trim();
+  s = s.replace(/\b([A-Za-z])\s+arrow\b/g, "$1 \\to");
+  s = s.replace(/\brightarrow\b/g, "\\rightarrow");
+  s = s.replace(/\barrow\b/g, "\\rightarrow");
+  s = s.replace(/(^|[^A-Za-z\\])to([^A-Za-z]|$)/g, "$1\\to$2");
+  return s.replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Fix piecewise / cases (hệ phương trình, hàm phân đoạn)
+ */
+function fixPiecewiseFunction(latex) {
+  let s = String(latex || "");
+
+  // Fix broken parentheses/brackets like "(. " "[. "
+  s = s.replace(/\(\.\s+/g, "(");
+  s = s.replace(/\s+\.\)/g, ")");
+  s = s.replace(/\[\.\s+/g, "[");
+  s = s.replace(/\s+\.\]/g, "]");
+
+  const piecewiseMatch = s.match(/(?<!\\)\{\.\s+/);
+  if (piecewiseMatch) {
+    const startIdx = piecewiseMatch.index;
+    const contentStart = startIdx + piecewiseMatch[0].length;
+
+    let braceCount = 1;
+    let endIdx = contentStart;
+    let foundEnd = false;
+
+    for (let i = contentStart; i < s.length; i++) {
+      const ch = s[i];
+      const prevCh = i > 0 ? s[i - 1] : "";
+      if (prevCh === "\\") continue;
+
+      if (ch === "{") braceCount++;
+      else if (ch === "}") {
+        braceCount--;
+        if (braceCount === 0) {
+          endIdx = i;
+          foundEnd = true;
+          break;
+        }
+      }
+    }
+
+    if (!foundEnd) endIdx = s.length;
+
+    let content = s.slice(contentStart, endIdx).trim();
+    content = content.replace(/\s+\.\s*$/, "");
+    // normalize new rows
+    content = content.replace(/\s+\\\s+(?=\d)/g, " \\\\ ");
+
+    const before = s.slice(0, startIdx);
+    const after = foundEnd ? s.slice(endIdx + 1) : "";
+    s = before + `\\begin{cases} ${content} \\end{cases}` + after;
+  }
+
+  return s;
+}
+
+/**
+ * ✅ XỬ LÝ CĂN (sqrt) “cứng”:
+ * - Nếu MathML có msqrt/mroot nhưng latex ra ký tự √ hoặc thiếu \sqrt => ép normalize.
+ * - Nếu latex có '√' -> đổi sang \sqrt{...} (heuristic).
+ */
+function fixSqrtLatex(latex, mathmlMaybe = "") {
+  let s = String(latex || "");
+
+  // 1) nếu có ký tự căn unicode => đổi dạng \sqrt{...} (đoán theo ngoặc)
+  // √(x+1) => \sqrt{x+1}
+  s = s.replace(/√\s*\(\s*([\s\S]*?)\s*\)/g, "\\sqrt{$1}");
+  // √x => \sqrt{x} (chỉ 1 token đơn)
+  s = s.replace(/√\s*([A-Za-z0-9]+)\b/g, "\\sqrt{$1}");
+
+  // 2) nếu MathML có căn mà latex lại không có \sqrt hoặc \root -> thử “đánh dấu”
+  if (SQRT_MATHML_RE.test(String(mathmlMaybe || ""))) {
+    const hasSqrt = /\\sqrt\b|\\root\b/.test(s);
+    if (!hasSqrt && s) {
+      // Một số output lỗi kiểu: "1/(x)"... không suy được; giữ nguyên
+      // nhưng ít nhất loại bỏ ký tự rác "radic" nếu có
+      s = s.replace(/\bradic\b/gi, "\\sqrt{}");
+    }
+  }
+
+  return s;
+}
+
+function postProcessLatex(latex, mathmlMaybe = "") {
+  let s = latex || "";
+  s = sanitizeLatexStrict(s);
+  s = fixSetBracesHard(s);
+  s = restoreArrowAndCoreCommands(s);
+  s = fixPiecewiseFunction(s);
+  s = fixSqrtLatex(s, mathmlMaybe);
+  return String(s || "").replace(/\s+/g, " ").trim();
+}
+
 function mathmlToLatexSafe(mml) {
   try {
     if (!mml || !mml.includes("<math")) return "";
-    const latex = MathMLToLaTeX.convert(mml);
-    return (latex || "").trim();
+    const latex0 = (MathMLToLaTeX.convert(mml) || "").trim();
+    return postProcessLatex(latex0, mml);
   } catch {
     return "";
   }
@@ -188,8 +366,12 @@ async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
     const oleTarget = rels.get(oleRid);
     if (!oleTarget) return block;
 
-    const vmlRid = block.match(/<v:imagedata\b[^>]*\br:id="([^"]+)"[^>]*\/>/);
-    const blipRid = block.match(/<a:blip\b[^>]*\br:embed="([^"]+)"[^>]*\/>/);
+    const vmlRid = block.match(
+      /<v:imagedata\b[^>]*\br:id="([^"]+)"[^>]*\/>/
+    );
+    const blipRid = block.match(
+      /<a:blip\b[^>]*\br:embed="([^"]+)"[^>]*\/>/
+    );
     const previewRid = vmlRid?.[1] || blipRid?.[1] || null;
 
     const key = `mathtype_${++idx}`;
@@ -217,7 +399,7 @@ async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
         }
       }
 
-      // 3) MathML -> LaTeX
+      // 3) MathML -> LaTeX (✅ có postprocess căn/cases)
       const latex = mml ? mathmlToLatexSafe(mml) : "";
       if (latex) {
         latexMap[key] = latex;
@@ -236,15 +418,17 @@ async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
               try {
                 const pngBuf = await maybeConvertEmfWmfToPng(imgBuf, imgFull);
                 if (pngBuf) {
-                  images[`fallback_${key}`] =
-                    `data:image/png;base64,${pngBuf.toString("base64")}`;
+                  images[`fallback_${key}`] = `data:image/png;base64,${pngBuf.toString(
+                    "base64"
+                  )}`;
                   latexMap[key] = "";
                   return;
                 }
               } catch {}
             }
-            images[`fallback_${key}`] =
-              `data:${mime};base64,${imgBuf.toString("base64")}`;
+            images[`fallback_${key}`] = `data:${mime};base64,${imgBuf.toString(
+              "base64"
+            )}`;
           }
         }
       }
@@ -311,20 +495,15 @@ async function tokenizeImagesAfter(docXml, rels, zipFiles) {
   return { outXml: docXml, imgMap };
 }
 
-/* ================= Text & Questions ================= */
-/**
- * ✅ HOÀN THIỆN:
- * - GIỮ token [!m:$...$]/[!img:$...$] để HTML render công thức + ảnh
- * - GIỮ underline bằng <u>...</u>
- * - Không đổi thuật toán MathType/LaTeX phía trên
- */
+/* ================= Text (GIỮ token + underline) ================= */
+
 function wordXmlToTextKeepTokens(docXml) {
   let x = docXml
     .replace(/<w:tab\s*\/>/g, "\t")
     .replace(/<w:br\s*\/>/g, "\n")
     .replace(/<\/w:p>/g, "\n");
 
-  // 1) Protect tokens BEFORE stripping tags (both $key$ and $$key$$)
+  // 1) Protect tokens BEFORE stripping tags
   x = x.replace(/\[!m:\$\$?(.*?)\$\$?\]/g, "___MATH_TOKEN___$1___END___");
   x = x.replace(/\[!img:\$\$?(.*?)\$\$?\]/g, "___IMG_TOKEN___$1___END___");
 
@@ -334,21 +513,14 @@ function wordXmlToTextKeepTokens(docXml) {
       /<w:u\b[^>]*\/>/.test(run) &&
       !/<w:u\b[^>]*w:val="none"[^>]*\/>/.test(run);
 
-    // remove run properties but keep content (tokens are plain text)
     let inner = run.replace(/<w:rPr\b[\s\S]*?<\/w:rPr>/g, "");
-
-    // w:t -> raw text
     inner = inner.replace(/<w:t\b[^>]*>([\s\S]*?)<\/w:t>/g, (_, t) => t ?? "");
-
-    // optional instrText
     inner = inner.replace(
       /<w:instrText\b[^>]*>([\s\S]*?)<\/w:instrText>/g,
       (_, t) => t ?? ""
     );
 
-    // remove remaining tags inside run
     inner = inner.replace(/<[^>]+>/g, "");
-
     if (!inner) return "";
     return hasU ? `<u>${inner}</u>` : inner;
   });
@@ -370,43 +542,275 @@ function wordXmlToTextKeepTokens(docXml) {
   return x;
 }
 
-function parseQuestions(text) {
-  const blocks = text.split(/(?=Câu\s+\d+\.)/);
-  const questions = [];
+/* ================== EXAM PARSER (BỔ SUNG ĐẦU RA GIỐNG A) ================== */
+
+function stripTagsToPlain(s) {
+  return String(s || "")
+    .replace(/<u[^>]*>/gi, "")
+    .replace(/<\/u>/gi, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function detectHasMCQ(plain) {
+  const marks = plain.match(/\b[ABCD]\./g) || [];
+  return new Set(marks).size >= 2;
+}
+
+function detectHasTF4(plain) {
+  const marks = plain.match(/\b[a-d]\)/gi) || [];
+  return new Set(marks.map((x) => x.toLowerCase())).size >= 2;
+}
+
+function extractUnderlinedKeys(blockText) {
+  const keys = { mcq: null, tf: [] };
+  const s = String(blockText || "");
+
+  let m =
+    s.match(/<u[^>]*>\s*([A-D])\s*<\/u>\s*\./i) ||
+    s.match(/<u[^>]*>\s*([A-D])\.\s*<\/u>/i);
+  if (m) keys.mcq = m[1].toUpperCase();
+
+  let mm;
+  const reTF1 = /<u[^>]*>\s*([a-d])\s*\)\s*<\/u>/gi;
+  while ((mm = reTF1.exec(s)) !== null) keys.tf.push(mm[1].toLowerCase());
+
+  const reTF2 = /<u[^>]*>\s*([a-d])\s*<\/u>\s*\)/gi;
+  while ((mm = reTF2.exec(s)) !== null) keys.tf.push(mm[1].toLowerCase());
+
+  keys.tf = [...new Set(keys.tf)];
+  return keys;
+}
+
+function normalizeUnderlinedMarkersForSplit(s) {
+  let x = String(s || "");
+  x = x.replace(/<u[^>]*>\s*([A-D])\s*<\/u>\s*\./gi, "$1.");
+  x = x.replace(/<u[^>]*>\s*([A-D])\.\s*<\/u>/gi, "$1.");
+  x = x.replace(/<u[^>]*>\s*([a-d])\s*\)\s*<\/u>/gi, "$1)");
+  x = x.replace(/<u[^>]*>\s*([a-d])\s*<\/u>\s*\)/gi, "$1)");
+  return x;
+}
+
+function findSolutionMarkerIndex(text, fromIndex = 0) {
+  const s = String(text || "");
+  const re =
+    /(Lời\s*giải|Giải\s*chi\s*tiết|Hướng\s*dẫn\s*giải)/i;
+  const sub = s.slice(fromIndex);
+  const m = re.exec(sub);
+  if (!m) return -1;
+  return fromIndex + m.index;
+}
+
+function splitSolutionSections(tailText) {
+  let s = String(tailText || "").trim();
+  if (!s) return { solution: "", detail: "" };
+
+  const reCT = /(Giải\s*chi\s*tiết)/i;
+  const matchCT = reCT.exec(s);
+  if (matchCT) {
+    const idxCT = matchCT.index;
+    return {
+      solution: s.slice(0, idxCT).trim(),
+      detail: s.slice(idxCT).trim(),
+    };
+  }
+  return { solution: s, detail: "" };
+}
+
+function cleanStemFromQuestionNo(s) {
+  return String(s || "").replace(/^Câu\s+\d+\.?\s*/i, "").trim();
+}
+
+function splitChoicesTextABCD(blockText) {
+  let s = normalizeUnderlinedMarkersForSplit(blockText);
+  // normalize line endings
+  s = s.replace(/\r/g, "");
+
+  const solIdx = findSolutionMarkerIndex(s, 0);
+  const main = solIdx >= 0 ? s.slice(0, solIdx) : s;
+  const tail = solIdx >= 0 ? s.slice(solIdx) : "";
+
+  // allow answers on same line
+  const re = /(^|\n)\s*(\*?)([A-D])\.\s*/g;
+
+  const hits = [];
+  let m;
+  while ((m = re.exec(main)) !== null) {
+    hits.push({ idx: m.index + m[1].length, star: m[2] === "*", key: m[3] });
+  }
+  if (hits.length < 2) return null;
+
+  const out = {
+    stem: main.slice(0, hits[0].idx).trim(),
+    choices: { A: "", B: "", C: "", D: "" },
+    starredCorrect: null,
+    tail,
+  };
+
+  for (let i = 0; i < hits.length; i++) {
+    const key = hits[i].key;
+    const start = hits[i].idx;
+    const end = i + 1 < hits.length ? hits[i + 1].idx : main.length;
+    let seg = main.slice(start, end).trim();
+    seg = seg.replace(/^(\*?)([A-D])\.\s*/i, "");
+    out.choices[key] = seg.trim();
+    if (hits[i].star) out.starredCorrect = key;
+  }
+  return out;
+}
+
+function splitStatementsTextabcd(blockText) {
+  let s = normalizeUnderlinedMarkersForSplit(blockText);
+  s = s.replace(/\r/g, "");
+
+  const solIdx = findSolutionMarkerIndex(s, 0);
+  const main = solIdx >= 0 ? s.slice(0, solIdx) : s;
+  const tail = solIdx >= 0 ? s.slice(solIdx) : "";
+
+  const re = /(^|\n)\s*([a-d])\)\s*/gi;
+  const hits = [];
+  let m;
+  while ((m = re.exec(main)) !== null) {
+    hits.push({ idx: m.index + m[1].length, key: m[2].toLowerCase() });
+  }
+  if (hits.length < 2) return null;
+
+  const out = {
+    stem: main.slice(0, hits[0].idx).trim(),
+    statements: { a: "", b: "", c: "", d: "" },
+    tail,
+  };
+
+  for (let i = 0; i < hits.length; i++) {
+    const key = hits[i].key;
+    const start = hits[i].idx;
+    const end = i + 1 < hits.length ? hits[i + 1].idx : main.length;
+    let seg = main.slice(start, end).trim();
+    seg = seg.replace(/^([a-d])\)\s*/i, "");
+    out.statements[key] = seg.trim();
+  }
+  return out;
+}
+
+/**
+ * ✅ OUTPUT “PHẦN CHO B”: exam.questions kiểu Azota-like:
+ * - mcq: stem + A/B/C/D + answer
+ * - tf4: stem + a/b/c/d + answer object
+ * - short: stem + boxes + solution/detail
+ *
+ * Đồng thời vẫn trả thêm "questions" cũ để bạn không bị vỡ front cũ.
+ */
+function parseExamFromText(text) {
+  const blocks = String(text || "").split(/(?=Câu\s+\d+\.)/);
+  const exam = { version: 9, questions: [] };
 
   for (const block of blocks) {
-    if (!block.startsWith("Câu")) continue;
+    if (!/^Câu\s+\d+\./i.test(block)) continue;
 
-    const q = {
-      type: "multiple_choice",
-      content: "",
-      choices: [],
-      correct: null,
-      solution: "",
-    };
+    const qnoMatch = block.match(/^Câu\s+(\d+)\./i);
+    const no = qnoMatch ? Number(qnoMatch[1]) : null;
 
-    const [main, solution] = block.split(/Lời giải/i);
-    q.solution = solution ? solution.trim() : "";
+    const under = extractUnderlinedKeys(block);
+    const plain = stripTagsToPlain(block);
 
-    // ✅ giữ nguyên thuật toán parse đáp án của bạn
-    const choiceRe =
-      /(\*?)([A-D])\.\s([\s\S]*?)(?=\n\*?[A-D]\.\s|\nLời giải|$)/g;
+    const isMCQ = detectHasMCQ(plain);
+    const isTF4 = !isMCQ && detectHasTF4(plain);
 
-    let m;
-    while ((m = choiceRe.exec(main))) {
-      const starred = m[1] === "*";
-      const label = m[2];
-      const content = (m[3] || "").trim();
-      if (starred) q.correct = label;
-      q.choices.push({ label, text: content });
+    if (isMCQ) {
+      const parts = splitChoicesTextABCD(block);
+      const tail = parts?.tail || "";
+      const solParts = splitSolutionSections(tail);
+
+      const answer = parts?.starredCorrect || under.mcq || null;
+
+      exam.questions.push({
+        no,
+        type: "mcq",
+        stem: cleanStemFromQuestionNo(parts?.stem || block),
+        choices: {
+          A: parts?.choices?.A || "",
+          B: parts?.choices?.B || "",
+          C: parts?.choices?.C || "",
+          D: parts?.choices?.D || "",
+        },
+        answer,
+        solution: solParts.solution || "",
+        detail: solParts.detail || "",
+        _plain: plain,
+      });
+      continue;
     }
 
-    const splitAtA = main.split(/\n\*?A\.\s/);
-    q.content = splitAtA[0].trim();
-    questions.push(q);
+    if (isTF4) {
+      const parts = splitStatementsTextabcd(block);
+      const tail = parts?.tail || "";
+      const solParts = splitSolutionSections(tail);
+
+      const ans = { a: null, b: null, c: null, d: null };
+      for (const k of ["a", "b", "c", "d"]) {
+        if (under.tf.includes(k)) ans[k] = true;
+      }
+
+      exam.questions.push({
+        no,
+        type: "tf4",
+        stem: cleanStemFromQuestionNo(parts?.stem || block),
+        statements: {
+          a: parts?.statements?.a || "",
+          b: parts?.statements?.b || "",
+          c: parts?.statements?.c || "",
+          d: parts?.statements?.d || "",
+        },
+        answer: ans,
+        solution: solParts.solution || "",
+        detail: solParts.detail || "",
+        _plain: plain,
+      });
+      continue;
+    }
+
+    // short / tự luận
+    const solIdx = findSolutionMarkerIndex(block, 0);
+    const stemPart = solIdx >= 0 ? block.slice(0, solIdx).trim() : block.trim();
+    const tailPart = solIdx >= 0 ? block.slice(solIdx).trim() : "";
+
+    const solParts = splitSolutionSections(tailPart);
+
+    exam.questions.push({
+      no,
+      type: "short",
+      stem: cleanStemFromQuestionNo(stemPart),
+      boxes: 4,
+      solution: solParts.solution || tailPart || "",
+      detail: solParts.detail || "",
+      _plain: plain,
+    });
   }
 
-  return questions;
+  return exam;
+}
+
+/**
+ * questions format cũ (để không vỡ front cũ) — lấy từ exam mcq
+ */
+function legacyQuestionsFromExam(exam) {
+  const out = [];
+  for (const q of exam.questions) {
+    if (q.type !== "mcq") continue;
+    out.push({
+      type: "multiple_choice",
+      content: q.stem,
+      choices: [
+        { label: "A", text: q.choices.A },
+        { label: "B", text: q.choices.B },
+        { label: "C", text: q.choices.C },
+        { label: "D", text: q.choices.D },
+      ],
+      correct: q.answer,
+      solution: [q.solution, q.detail].filter(Boolean).join("\n").trim(),
+    });
+  }
+  return out;
 }
 
 /* ================= API ================= */
@@ -428,30 +832,45 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     const relsXml = (await relEntry.buffer()).toString("utf8");
     const rels = parseRels(relsXml);
 
-    // 1) MathType -> LaTeX (and fallback images) ✅ giữ nguyên
+    // 1) MathType -> LaTeX (and fallback images) ✅ giữ pipeline B
     const images = {};
     const mt = await tokenizeMathTypeOleFirst(docXml, rels, zip.files, images);
     docXml = mt.outXml;
     const latexMap = mt.latexMap;
 
-    // 2) normal images ✅ giữ nguyên
+    // 2) normal images ✅ giữ pipeline B
     const imgTok = await tokenizeImagesAfter(docXml, rels, zip.files);
     docXml = imgTok.outXml;
     Object.assign(images, imgTok.imgMap);
 
-    // 3) text ✅ giờ giữ token + underline
+    // 3) text ✅ giữ token + underline
     const text = wordXmlToTextKeepTokens(docXml);
 
-    // 4) parse questions ✅ giữ nguyên
-    const questions = parseQuestions(text);
+    // 4) NEW: parse exam output (mcq/tf4/short)
+    const exam = parseExamFromText(text);
+
+    // 5) legacy questions output (mcq only) for backward compatibility
+    const questions = legacyQuestionsFromExam(exam);
 
     res.json({
       ok: true,
-      total: questions.length,
+      total: exam.questions.length,
+      exam,
+      // giữ field cũ
       questions,
       latex: latexMap,
       images,
       rawText: text,
+      debug: {
+        latexCount: Object.keys(latexMap).length,
+        imagesCount: Object.keys(images).length,
+        exam: {
+          questions: exam.questions.length,
+          mcq: exam.questions.filter((x) => x.type === "mcq").length,
+          tf4: exam.questions.filter((x) => x.type === "tf4").length,
+          short: exam.questions.filter((x) => x.type === "short").length,
+        },
+      },
     });
   } catch (err) {
     console.error(err);
