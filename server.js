@@ -112,12 +112,9 @@ async function maybeConvertEmfWmfToPng(buf, filename) {
 
 /* ================= MathType OLE -> MathML -> LaTeX ================= */
 
-// ✅ debug/nhận diện căn thức trong MathML
+// debug/nhận diện căn thức trong MathML
 const SQRT_MATHML_RE = /(msqrt|mroot|√|&#8730;|&#x221a;|&#x221A;|&radic;)/i;
 
-/**
- * scan MathML embedded directly in OLE (nhanh)
- */
 function extractMathMLFromOleScan(buf) {
   const utf8 = buf.toString("utf8");
   let i = utf8.indexOf("<math");
@@ -136,10 +133,7 @@ function extractMathMLFromOleScan(buf) {
   return null;
 }
 
-/**
- * fallback: call ruby mt2mml.rb ole.bin -> MathML
- * ✅ HOÀN THIỆN: cắt đúng block <math>...</math> (nếu ruby in kèm log)
- */
+// ruby mt2mml.rb ole.bin -> MathML (cắt đúng block math nếu có)
 function rubyOleToMathML(oleBuf) {
   return new Promise((resolve, reject) => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ole-"));
@@ -159,7 +153,6 @@ function rubyOleToMathML(oleBuf) {
         const out = String(stdout || "");
         const decoded = decodeXmlEntities(out);
 
-        // cố gắng lấy đúng block MathML nếu có (kể cả namespace mml:math)
         const m =
           decoded.match(/<[^<]{0,20}math[\s\S]*?<\/[^<]{0,20}math>/i) ||
           out.match(/<[^<]{0,20}math[\s\S]*?<\/[^<]{0,20}math>/i);
@@ -171,17 +164,45 @@ function rubyOleToMathML(oleBuf) {
 }
 
 /**
- * ✅ FIX CĂN THỨC: decode entity trước khi MathMLToLaTeX.convert()
+ * NORMALIZE căn: nếu MathML biểu diễn căn bằng operator √ (<mo>√</mo>)
+ * thì chuyển về <msqrt>...</msqrt>
  */
+function normalizeSqrtOperatorToMsqrt(mathml) {
+  let s = String(mathml || "");
+
+  if (/(<\s*msqrt\b|<\s*mroot\b)/i.test(s)) return s;
+
+  const decoded = decodeXmlEntities(s);
+  if (!decoded.includes("√")) return decoded;
+
+  let out = decoded;
+
+  out = out.replace(
+    /<mo>\s*√\s*<\/mo>\s*<mrow>([\s\S]*?)<\/mrow>/gi,
+    "<msqrt><mrow>$1</mrow></msqrt>"
+  );
+
+  out = out.replace(
+    /<mo>\s*√\s*<\/mo>\s*(<(mi|mn|msup|msub|msubsup|mfrac|mover|munder|munderover|mfenced)\b[\s\S]*?<\/\2>)/gi,
+    "<msqrt>$1</msqrt>"
+  );
+
+  out = out.replace(
+    /<mo>\s*√\s*<\/mo>\s*(<mtext\b[\s\S]*?<\/mtext>)/gi,
+    "<msqrt>$1</msqrt>"
+  );
+
+  return out;
+}
+
 function mathmlToLatexSafe(mml) {
   try {
     if (!mml) return "";
 
-    const normalized = decodeXmlEntities(String(mml).trim());
+    let normalized = decodeXmlEntities(String(mml).trim());
+    normalized = normalizeSqrtOperatorToMsqrt(normalized);
 
-    // một số output có namespace <mml:math...>
-    if (!normalized.includes("<math") && !normalized.includes(":math"))
-      return "";
+    if (!normalized.includes("<math") && !normalized.includes(":math")) return "";
 
     const latex = MathMLToLaTeX.convert(normalized);
     return (latex || "").trim();
@@ -190,17 +211,9 @@ function mathmlToLatexSafe(mml) {
   }
 }
 
-/**
- * MathType FIRST:
- * - token [!m:$mathtype_x$]
- * - produce:
- *   latexMap[key] = "..."
- *   (optional) images["fallback_key"] = png dataURL if latex fails
- * ✅ HOÀN THIỆN: trả thêm sqrtDebug để debug căn thức
- */
 async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
   let idx = 0;
-  const found = {}; // key -> { oleTarget, previewRid }
+  const found = {};
 
   const OBJECT_RE = /<w:object[\s\S]*?<\/w:object>/g;
 
@@ -222,18 +235,16 @@ async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
   });
 
   const latexMap = {};
-  const sqrtDebug = []; // ✅ debug căn thức
+  const sqrtDebug = [];
 
   await Promise.all(
     Object.entries(found).map(async ([key, info]) => {
       const oleFull = normalizeTargetToWordPath(info.oleTarget);
       const oleBuf = await getZipEntryBuffer(zipFiles, oleFull);
 
-      // 1) try scan MathML inside OLE
       let mml = "";
       if (oleBuf) mml = extractMathMLFromOleScan(oleBuf) || "";
 
-      // 2) fallback ruby convert (MTEF inside OLE)
       if (!mml && oleBuf) {
         try {
           mml = await rubyOleToMathML(oleBuf);
@@ -242,12 +253,10 @@ async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
         }
       }
 
-      // ✅ debug căn thức: check trước khi convert
       const mmlDecoded = decodeXmlEntities(mml || "");
       const hasSqrt =
         SQRT_MATHML_RE.test(mml || "") || SQRT_MATHML_RE.test(mmlDecoded);
 
-      // 3) MathML -> LaTeX (đã decode trong mathmlToLatexSafe)
       const latex = mml ? mathmlToLatexSafe(mml) : "";
 
       if (hasSqrt) {
@@ -266,7 +275,7 @@ async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
         return;
       }
 
-      // 4) If no latex, fallback to preview image (convert emf/wmf->png)
+      // fallback preview image
       if (info.previewRid) {
         const t = rels.get(info.previewRid);
         if (t) {
@@ -298,9 +307,6 @@ async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
   return { outXml: docXml, latexMap, sqrtDebug };
 }
 
-/**
- * Tokenize normal images AFTER MathType (and convert EMF/WMF -> PNG if possible)
- */
 async function tokenizeImagesAfter(docXml, rels, zipFiles) {
   let idx = 0;
   const imgMap = {};
@@ -354,51 +360,35 @@ async function tokenizeImagesAfter(docXml, rels, zipFiles) {
 }
 
 /* ================= Text & Questions ================= */
-/**
- * ✅ HOÀN THIỆN:
- * - GIỮ token [!m:$...$]/[!img:$...$] để HTML render công thức + ảnh
- * - GIỮ underline bằng <u>...</u>
- * - Không đổi thuật toán MathType/LaTeX phía trên
- */
+
 function wordXmlToTextKeepTokens(docXml) {
   let x = docXml
     .replace(/<w:tab\s*\/>/g, "\t")
     .replace(/<w:br\s*\/>/g, "\n")
     .replace(/<\/w:p>/g, "\n");
 
-  // 1) Protect tokens BEFORE stripping tags (both $key$ and $$key$$)
   x = x.replace(/\[!m:\$\$?(.*?)\$\$?\]/g, "___MATH_TOKEN___$1___END___");
   x = x.replace(/\[!img:\$\$?(.*?)\$\$?\]/g, "___IMG_TOKEN___$1___END___");
 
-  // 2) Convert each run <w:r> while preserving underline + token text
   x = x.replace(/<w:r\b[\s\S]*?<\/w:r>/g, (run) => {
     const hasU =
       /<w:u\b[^>]*\/>/.test(run) &&
       !/<w:u\b[^>]*w:val="none"[^>]*\/>/.test(run);
 
-    // remove run properties but keep content (tokens are plain text)
     let inner = run.replace(/<w:rPr\b[\s\S]*?<\/w:rPr>/g, "");
-
-    // w:t -> raw text
     inner = inner.replace(/<w:t\b[^>]*>([\s\S]*?)<\/w:t>/g, (_, t) => t ?? "");
-
-    // optional instrText
     inner = inner.replace(
       /<w:instrText\b[^>]*>([\s\S]*?)<\/w:instrText>/g,
       (_, t) => t ?? ""
     );
-
-    // remove remaining tags inside run
     inner = inner.replace(/<[^>]+>/g, "");
 
     if (!inner) return "";
     return hasU ? `<u>${inner}</u>` : inner;
   });
 
-  // 3) Remove remaining tags outside runs, but keep <u>
   x = x.replace(/<(?!\/?u\b)[^>]+>/g, "");
 
-  // 4) Restore tokens in a stable form (use $$ ... $$)
   x = x
     .replace(/___MATH_TOKEN___(.*?)___END___/g, "[!m:$$$1$$]")
     .replace(/___IMG_TOKEN___(.*?)___END___/g, "[!img:$$$1$$]");
@@ -430,7 +420,6 @@ function parseQuestions(text) {
     const [main, solution] = block.split(/Lời giải/i);
     q.solution = solution ? solution.trim() : "";
 
-    // ✅ giữ nguyên thuật toán parse đáp án của bạn
     const choiceRe =
       /(\*?)([A-D])\.\s([\s\S]*?)(?=\n\*?[A-D]\.\s|\nLời giải|$)/g;
 
@@ -470,22 +459,17 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     const relsXml = (await relEntry.buffer()).toString("utf8");
     const rels = parseRels(relsXml);
 
-    // 1) MathType -> LaTeX (and fallback images) ✅ giữ nguyên flow, thêm debug căn thức
     const images = {};
     const mt = await tokenizeMathTypeOleFirst(docXml, rels, zip.files, images);
     docXml = mt.outXml;
     const latexMap = mt.latexMap;
     const sqrtDebug = mt.sqrtDebug || [];
 
-    // 2) normal images ✅ giữ nguyên
     const imgTok = await tokenizeImagesAfter(docXml, rels, zip.files);
     docXml = imgTok.outXml;
     Object.assign(images, imgTok.imgMap);
 
-    // 3) text ✅ giờ giữ token + underline
     const text = wordXmlToTextKeepTokens(docXml);
-
-    // 4) parse questions ✅ giữ nguyên
     const questions = parseQuestions(text);
 
     res.json({
@@ -495,7 +479,7 @@ app.post("/upload", upload.single("file"), async (req, res) => {
       latex: latexMap,
       images,
       rawText: text,
-      sqrtDebug, // ✅ thêm debug căn thức
+      sqrtDebug,
     });
   } catch (err) {
     console.error(err);
