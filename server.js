@@ -10,6 +10,7 @@ import { MathMLToLaTeX } from "mathml-to-latex";
 
 const app = express();
 app.use(cors());
+app.use(express.json({ limit: "25mb" }));
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -147,7 +148,9 @@ function rubyOleToMathML(oleBuf) {
       ["mt2mml.rb", inPath],
       { timeout: 30000, maxBuffer: 20 * 1024 * 1024 },
       (err, stdout, stderr) => {
-        try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+        try {
+          fs.rmSync(tmpDir, { recursive: true, force: true });
+        } catch {}
         if (err) return reject(new Error(stderr || err.message));
         resolve(String(stdout || "").trim());
       }
@@ -158,7 +161,6 @@ function rubyOleToMathML(oleBuf) {
 function mathmlToLatexSafe(mml) {
   try {
     if (!mml || !mml.includes("<math")) return "";
-    // mathml-to-latex expects a MathML string
     const latex = MathMLToLaTeX.convert(mml);
     return (latex || "").trim();
   } catch {
@@ -310,44 +312,95 @@ async function tokenizeImagesAfter(docXml, rels, zipFiles) {
   return { outXml: docXml, imgMap };
 }
 
-/* ================= Text & Questions ================= */
+/* ================= Text: keep tokens + underline ================= */
 
 function wordXmlToTextKeepTokens(docXml) {
+  // chuẩn hoá tab, br
   let x = docXml
     .replace(/<w:tab\s*\/>/g, "\t")
-    .replace(/<w:br\s*\/>/g, "\n")
-    .replace(/<\/w:p>/g, "\n");
+    .replace(/<w:br\s*\/>/g, "\n");
 
-  // keep tokens
+  // giữ tokens trước khi parse run
   x = x.replace(/\[!m:\$(.*?)\$\]/g, "___MATH_TOKEN___$1___END___");
   x = x.replace(/\[!img:\$(.*?)\$\]/g, "___IMG_TOKEN___$1___END___");
 
-  x = x.replace(/<w:t\b[^>]*>[\s\S]*?<\/w:t>/g, (seg) => {
-    const mm = seg.match(/<w:t\b[^>]*>([\s\S]*?)<\/w:t>/);
-    return mm ? mm[1] : "";
-  });
+  // tách paragraph
+  const paras = x.match(/<w:p\b[\s\S]*?<\/w:p>/g) || [];
+  const out = [];
 
-  x = x.replace(/<[^>]+>/g, "");
+  for (const p of paras) {
+    const runs = p.match(/<w:r\b[\s\S]*?<\/w:r>/g) || [];
+    let line = "";
 
-  x = x
+    for (const r of runs) {
+      // underline?
+      let isUnderline = false;
+      const uTag = r.match(/<w:u\b[^>]*\/>/);
+      if (uTag) {
+        const val = uTag[0].match(/w:val="([^"]+)"/)?.[1];
+        isUnderline = !val || val.toLowerCase() !== "none";
+      }
+
+      // lấy text trong run
+      const texts = [];
+      const tRe = /<w:t\b[^>]*>([\s\S]*?)<\/w:t>/g;
+      let tm;
+      while ((tm = tRe.exec(r))) texts.push(tm[1] ?? "");
+      if (!texts.length) continue;
+
+      let runText = texts.join("");
+
+      // KHÔNG để underline "ăn" vào token math/img
+      const parts = runText.split(
+        /(___MATH_TOKEN___.*?___END___|___IMG_TOKEN___.*?___END___)/g
+      );
+
+      const rebuilt = parts
+        .map((part) => {
+          if (!part) return "";
+          const isToken =
+            part.startsWith("___MATH_TOKEN___") ||
+            part.startsWith("___IMG_TOKEN___");
+          if (isToken) return part;
+          return isUnderline ? `<u>${part}</u>` : part;
+        })
+        .join("");
+
+      line += rebuilt;
+    }
+
+    // decode entities
+    line = decodeXmlEntities(line).replace(/\r/g, "");
+
+    // chỉ cho phép <u> </u>
+    line = line.replace(/<[^>]+>/g, (m) => {
+      if (m === "<u>" || m === "</u>") return m;
+      return "";
+    });
+
+    if (line.trim().length > 0) out.push(line);
+  }
+
+  let text = out.join("\n");
+  text = text.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+
+  // restore token: chuẩn $$...$$
+  text = text
     .replace(/___MATH_TOKEN___(.*?)___END___/g, "[!m:$$$1$$]")
     .replace(/___IMG_TOKEN___(.*?)___END___/g, "[!img:$$$1$$]");
 
-  x = decodeXmlEntities(x)
-    .replace(/\r/g, "")
-    .replace(/[ \t]+\n/g, "\n")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-
-  return x;
+  return text;
 }
+
+/* ================= Questions (robust, không dính A. B.) ================= */
 
 function parseQuestions(text) {
   const blocks = text.split(/(?=Câu\s+\d+\.)/);
   const questions = [];
 
-  for (const block of blocks) {
-    if (!block.startsWith("Câu")) continue;
+  for (const block0 of blocks) {
+    const block = block0.trim();
+    if (!/^Câu\s+\d+\./.test(block)) continue;
 
     const q = {
       type: "multiple_choice",
@@ -357,14 +410,25 @@ function parseQuestions(text) {
       solution: "",
     };
 
-    const [main, solution] = block.split(/Lời giải/i);
-    q.solution = solution ? solution.trim() : "";
+    const parts = block.split(/(?:\n|\r|\r\n)?Lời giải/i);
+    const main = parts[0] || "";
+    q.solution = (parts[1] || "").trim();
+
+    const idxA = main.search(/(?:^|\n)\*?A\.\s*/m);
+    if (idxA === -1) {
+      q.content = main.trim();
+      questions.push(q);
+      continue;
+    }
+
+    q.content = main.slice(0, idxA).trim();
+    const choicesPart = main.slice(idxA);
 
     const choiceRe =
-      /(\*?)([A-D])\.\s([\s\S]*?)(?=\n\*?[A-D]\.\s|\nLời giải|$)/g;
+      /(?:^|\n)(\*?)([A-D])\.\s*([\s\S]*?)(?=(?:\n\*?[A-D]\.\s*)|\nLời giải|$)/g;
 
     let m;
-    while ((m = choiceRe.exec(main))) {
+    while ((m = choiceRe.exec(choicesPart))) {
       const starred = m[1] === "*";
       const label = m[2];
       const content = (m[3] || "").trim();
@@ -372,8 +436,6 @@ function parseQuestions(text) {
       q.choices.push({ label, text: content });
     }
 
-    const splitAtA = main.split(/\n\*?A\.\s/);
-    q.content = splitAtA[0].trim();
     questions.push(q);
   }
 
@@ -384,6 +446,8 @@ function parseQuestions(text) {
 
 app.post("/upload", upload.single("file"), async (req, res) => {
   try {
+    if (!req.file?.buffer) throw new Error("No file uploaded");
+
     const zip = await unzipper.Open.buffer(req.file.buffer);
 
     const docEntry = zip.files.find((f) => f.path === "word/document.xml");
@@ -391,37 +455,40 @@ app.post("/upload", upload.single("file"), async (req, res) => {
       (f) => f.path === "word/_rels/document.xml.rels"
     );
     if (!docEntry || !relEntry)
-      throw new Error("Missing document.xml or document.xml.rels");
+      throw new Error("Missing word/document.xml or word/_rels/document.xml.rels");
 
     let docXml = (await docEntry.buffer()).toString("utf8");
     const relsXml = (await relEntry.buffer()).toString("utf8");
     const rels = parseRels(relsXml);
 
-    // 1) MathType -> LaTeX (and fallback images)
+    // 1) MathType -> LaTeX (giữ nguyên thuật toán)
     const images = {};
     const mt = await tokenizeMathTypeOleFirst(docXml, rels, zip.files, images);
     docXml = mt.outXml;
     const latexMap = mt.latexMap;
 
-    // 2) normal images
+    // 2) images
     const imgTok = await tokenizeImagesAfter(docXml, rels, zip.files);
     docXml = imgTok.outXml;
     Object.assign(images, imgTok.imgMap);
 
+    // 3) text giữ underline + token chuẩn $$...$$
     const text = wordXmlToTextKeepTokens(docXml);
+
+    // 4) parse câu hỏi robust
     const questions = parseQuestions(text);
 
     res.json({
       ok: true,
       total: questions.length,
       questions,
-      latex: latexMap,  // ✅ LaTeX like Azota
-      images,           // fallback image if latex empty
+      latex: latexMap,
+      images,
       rawText: text,
     });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ ok: false, error: err.message });
+    res.status(500).json({ ok: false, error: err?.message || String(err) });
   }
 });
 
