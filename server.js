@@ -114,47 +114,23 @@ async function maybeConvertEmfWmfToPng(buf, filename) {
 
 /**
  * scan MathML embedded directly in OLE (nhanh)
- * - mở rộng để phát hiện MathML bị escape (&lt;math ... &gt;)
  */
 function extractMathMLFromOleScan(buf) {
-  try {
-    const utf8 = buf.toString("utf8");
-    let i = utf8.indexOf("<math");
-    if (i !== -1) {
-      let j = utf8.indexOf("</math>", i);
-      if (j !== -1) return utf8.slice(i, j + 7);
-    }
-
-    const u16 = buf.toString("utf16le");
-    i = u16.indexOf("<math");
-    if (i !== -1) {
-      let j = u16.indexOf("</math>", i);
-      if (j !== -1) return u16.slice(i, j + 7);
-    }
-
-    // Thử tìm MathML bị escape như &lt;math ... &gt;
-    i = utf8.indexOf("&lt;math");
-    if (i !== -1) {
-      let j = utf8.indexOf("&lt;/math&gt;", i);
-      if (j !== -1) {
-        const esc = utf8.slice(i, j + "&lt;/math&gt;".length);
-        return decodeXmlEntities(esc);
-      }
-    }
-
-    i = u16.indexOf("&lt;math");
-    if (i !== -1) {
-      let j = u16.indexOf("&lt;/math&gt;", i);
-      if (j !== -1) {
-        const esc = u16.slice(i, j + "&lt;/math&gt;".length);
-        return decodeXmlEntities(esc);
-      }
-    }
-
-    return null;
-  } catch {
-    return null;
+  const utf8 = buf.toString("utf8");
+  let i = utf8.indexOf("<math");
+  if (i !== -1) {
+    let j = utf8.indexOf("</math>", i);
+    if (j !== -1) return utf8.slice(i, j + 7);
   }
+
+  const u16 = buf.toString("utf16le");
+  i = u16.indexOf("<math");
+  if (i !== -1) {
+    let j = u16.indexOf("</math>", i);
+    if (j !== -1) return u16.slice(i, j + 7);
+  }
+
+  return null;
 }
 
 /**
@@ -184,55 +160,9 @@ function rubyOleToMathML(oleBuf) {
 function mathmlToLatexSafe(mml) {
   try {
     if (!mml || !mml.includes("<math")) return "";
-
-    // 1) thử convert bằng thư viện chính
-    try {
-      const latex = (MathMLToLaTeX.convert(mml) || "").trim();
-      if (latex) return latex;
-    } catch (e) {
-      // nếu thư viện ném lỗi thì tiếp tục fallback
-      console.debug("MathMLToLaTeX.convert error:", e?.message || e);
-    }
-
-    // 2) nếu không có kết quả, thử xử lý một vài tag MathML thông dụng thủ công
-    let s = mml;
-
-    // a) xử lý <msqrt>...</msqrt> -> \sqrt{...}
-    s = s.replace(/<msqrt\b[^>]*>([\s\S]*?)<\/msqrt>/gi, (m, inner) => {
-      const content = inner.replace(/<[^>]+>/g, "").trim();
-      // trả về LaTeX dạng \sqrt{...}
-      return `\\sqrt{${content}}`;
-    });
-
-    // b) xử lý <mroot>radicand index</mroot> -> \sqrt[index]{radicand}
-    s = s.replace(/<mroot\b[^>]*>([\s\S]*?)<\/mroot>/gi, (m, inner) => {
-      // Thử tách bằng heuristic: phần đầu là radicand, phần sau là index
-      // Bằng cách tìm phần tử con cuối cùng là index
-      // Loại bỏ tag, split theo thẻ đóng -> mở
-      const parts = inner
-        .replace(/>\s+</g, "><")
-        .split(/<\/[^>]+>\s*<[^>]+>/)
-        .map((p) => p.replace(/<[^>]+>/g, "").trim())
-        .filter(Boolean);
-      if (parts.length >= 2) {
-        const rad = parts[0];
-        const idx = parts[1];
-        return `\\sqrt[${idx}]{${rad}}`;
-      }
-      // fallback: strip tags
-      const stripped = inner.replace(/<[^>]+>/g, "").trim();
-      return stripped;
-    });
-
-    // c) loại bỏ tag còn lại và decode entity để lấy text plain (heuristic)
-    s = decodeXmlEntities(s.replace(/<[^>]+>/g, "")).trim();
-
-    // d) nếu sau xử lý còn text thì coi đó là LaTeX tạm thời
-    if (s) return s;
-
-    return "";
-  } catch (e) {
-    console.debug("mathmlToLatexSafe error:", e?.message || e);
+    const latex = MathMLToLaTeX.convert(mml);
+    return (latex || "").trim();
+  } catch {
     return "";
   }
 }
@@ -276,32 +206,13 @@ async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
 
       // 1) try scan MathML inside OLE
       let mml = "";
-      if (oleBuf) {
-        try {
-          mml = extractMathMLFromOleScan(oleBuf) || "";
-        } catch (e) {
-          mml = "";
-        }
-      }
-
-      if (mml) {
-        console.debug(`[MathType] found MathML directly for ${key} (len=${mml.length})`);
-      } else {
-        console.debug(`[MathType] no direct MathML found for ${key}`);
-      }
+      if (oleBuf) mml = extractMathMLFromOleScan(oleBuf) || "";
 
       // 2) fallback ruby convert (MTEF inside OLE)
       if (!mml && oleBuf) {
         try {
-          const out = await rubyOleToMathML(oleBuf);
-          if (out) {
-            mml = out;
-            console.debug(`[MathType] ruby mt2mml produced MathML for ${key} (len=${mml.length})`);
-          } else {
-            console.debug(`[MathType] ruby mt2mml produced empty output for ${key}`);
-          }
-        } catch (e) {
-          console.debug(`[MathType] ruby mt2mml failed for ${key}:`, e?.message || e);
+          mml = await rubyOleToMathML(oleBuf);
+        } catch {
           mml = "";
         }
       }
@@ -310,16 +221,7 @@ async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
       const latex = mml ? mathmlToLatexSafe(mml) : "";
       if (latex) {
         latexMap[key] = latex;
-        console.debug(`[MathType] latex for ${key}:`, latex.slice(0, 200));
         return;
-      }
-
-      if (mml && !latex) {
-        // debug snippet
-        console.debug(
-          `[MathType] mathml->latex returned empty for ${key} — MathML snippet:`,
-          (mml || "").slice(0, 400).replace(/\n/g, " ")
-        );
       }
 
       // 4) If no latex, fallback to preview image (convert emf/wmf->png)
@@ -337,16 +239,12 @@ async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
                   images[`fallback_${key}`] =
                     `data:image/png;base64,${pngBuf.toString("base64")}`;
                   latexMap[key] = "";
-                  console.debug(`[MathType] used converted PNG fallback for ${key}`);
                   return;
                 }
-              } catch (e) {
-                console.debug(`[MathType] emf/wmf->png conversion failed for ${key}:`, e?.message || e);
-              }
+              } catch {}
             }
             images[`fallback_${key}`] =
               `data:${mime};base64,${imgBuf.toString("base64")}`;
-            console.debug(`[MathType] used image fallback for ${key} (mime=${mime})`);
           }
         }
       }
@@ -384,9 +282,7 @@ async function tokenizeImagesAfter(docXml, rels, zipFiles) {
               imgMap[key] = `data:image/png;base64,${pngBuf.toString("base64")}`;
               return;
             }
-          } catch (e) {
-            console.debug("EMF/WMF conversion error:", e?.message || e);
-          }
+          } catch {}
         }
         imgMap[key] = `data:${mime};base64,${buf.toString("base64")}`;
       })()
@@ -415,36 +311,6 @@ async function tokenizeImagesAfter(docXml, rels, zipFiles) {
   return { outXml: docXml, imgMap };
 }
 
- * ✅ FIX: Pre-process MathML to ensure sqrt elements are properly formatted
- * Some MathType outputs have non-standard sqrt representations
- */
-function preprocessMathMLForSqrt(mathml) {
-  if (!mathml) return mathml;
-  let s = String(mathml);
-
-  // Match sqrt operator inside <mo>...</mo> including common entities
-  const moSqrt = String.raw`<mo>\s*(?:√|&#8730;|&#x221a;|&#x221A;|&radic;)\s*<\/mo>`;
-
-  // Convert "sqrt operator + following node" into proper <msqrt>...</msqrt>
-  s = s.replace(
-    new RegExp(moSqrt + String.raw`\s*<mrow>([\s\S]*?)<\/mrow>`, "gi"),
-    "<msqrt>$1</msqrt>"
-  );
-  s = s.replace(
-    new RegExp(moSqrt + String.raw`\s*<mi>([^<]+)<\/mi>`, "gi"),
-    "<msqrt><mi>$1</mi></msqrt>"
-  );
-  s = s.replace(
-    new RegExp(moSqrt + String.raw`\s*<mn>([^<]+)<\/mn>`, "gi"),
-    "<msqrt><mn>$1</mn></msqrt>"
-  );
-  s = s.replace(
-    new RegExp(moSqrt + String.raw`\s*<mfenced([^>]*)>([\s\S]*?)<\/mfenced>`, "gi"),
-    "<msqrt><mfenced$1>$2</mfenced></msqrt>"
-  );
-
-  return s;
-}
 /* ================= Text & Questions ================= */
 /**
  * ✅ HOÀN THIỆN:
