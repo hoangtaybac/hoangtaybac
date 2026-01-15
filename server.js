@@ -7,14 +7,9 @@ import os from "os";
 import path from "path";
 import { execFile, execFileSync } from "child_process";
 import { MathMLToLaTeX } from "mathml-to-latex";
-import { fileURLToPath } from "url";
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "25mb" }));
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -119,28 +114,27 @@ async function maybeConvertEmfWmfToPng(buf, filename) {
 
 /**
  * scan MathML embedded directly in OLE (nhanh)
- * ✅ FIX: bắt được cả <math> và <m:math>/<mml:math> (namespace prefix)
  */
 function extractMathMLFromOleScan(buf) {
-  const pickMath = (s) => {
-    if (!s) return null;
-    const re = /<([a-zA-Z0-9]+:)?math\b[\s\S]*?<\/\1?math>/i;
-    const m = s.match(re);
-    return m ? m[0] : null;
-  };
+  const utf8 = buf.toString("utf8");
+  let i = utf8.indexOf("<math");
+  if (i !== -1) {
+    let j = utf8.indexOf("</math>", i);
+    if (j !== -1) return utf8.slice(i, j + 7);
+  }
 
-  let mml = pickMath(buf.toString("utf8"));
-  if (mml) return mml;
-
-  mml = pickMath(buf.toString("utf16le"));
-  if (mml) return mml;
+  const u16 = buf.toString("utf16le");
+  i = u16.indexOf("<math");
+  if (i !== -1) {
+    let j = u16.indexOf("</math>", i);
+    if (j !== -1) return u16.slice(i, j + 7);
+  }
 
   return null;
 }
 
 /**
  * fallback: call ruby mt2mml.rb ole.bin -> MathML
- * ✅ FIX: dùng absolute path theo đúng thư mục chứa server.mjs
  */
 function rubyOleToMathML(oleBuf) {
   return new Promise((resolve, reject) => {
@@ -148,17 +142,9 @@ function rubyOleToMathML(oleBuf) {
     const inPath = path.join(tmpDir, "oleObject.bin");
     fs.writeFileSync(inPath, oleBuf);
 
-    const scriptPath = path.join(__dirname, "mt2mml.rb");
-    if (!fs.existsSync(scriptPath)) {
-      try {
-        fs.rmSync(tmpDir, { recursive: true, force: true });
-      } catch {}
-      return reject(new Error(`Missing mt2mml.rb at ${scriptPath}`));
-    }
-
     execFile(
       "ruby",
-      [scriptPath, inPath],
+      ["mt2mml.rb", inPath],
       { timeout: 30000, maxBuffer: 20 * 1024 * 1024 },
       (err, stdout, stderr) => {
         try {
@@ -171,15 +157,10 @@ function rubyOleToMathML(oleBuf) {
   });
 }
 
-/**
- * ✅ FIX: normalize namespace prefix trước khi convert để ra căn thức ổn định
- */
 function mathmlToLatexSafe(mml) {
   try {
-    if (!mml) return "";
-    const normalized = mml.replace(/<(\/?)([a-zA-Z0-9]+):/g, "<$1");
-    if (!normalized.includes("<math")) return "";
-    const latex = MathMLToLaTeX.convert(normalized);
+    if (!mml || !mml.includes("<math")) return "";
+    const latex = MathMLToLaTeX.convert(mml);
     return (latex || "").trim();
   } catch {
     return "";
@@ -331,38 +312,51 @@ async function tokenizeImagesAfter(docXml, rels, zipFiles) {
 }
 
 /* ================= Text & Questions ================= */
-
+/**
+ * ✅ HOÀN THIỆN:
+ * - GIỮ token [!m:$...$]/[!img:$...$] để HTML render công thức + ảnh
+ * - GIỮ underline bằng <u>...</u>
+ * - Không đổi thuật toán MathType/LaTeX phía trên
+ */
 function wordXmlToTextKeepTokens(docXml) {
   let x = docXml
     .replace(/<w:tab\s*\/>/g, "\t")
     .replace(/<w:br\s*\/>/g, "\n")
     .replace(/<\/w:p>/g, "\n");
 
+  // 1) Protect tokens BEFORE stripping tags (both $key$ and $$key$$)
   x = x.replace(/\[!m:\$\$?(.*?)\$\$?\]/g, "___MATH_TOKEN___$1___END___");
   x = x.replace(/\[!img:\$\$?(.*?)\$\$?\]/g, "___IMG_TOKEN___$1___END___");
 
+  // 2) Convert each run <w:r> while preserving underline + token text
   x = x.replace(/<w:r\b[\s\S]*?<\/w:r>/g, (run) => {
     const hasU =
       /<w:u\b[^>]*\/>/.test(run) &&
       !/<w:u\b[^>]*w:val="none"[^>]*\/>/.test(run);
 
+    // remove run properties but keep content (tokens are plain text)
     let inner = run.replace(/<w:rPr\b[\s\S]*?<\/w:rPr>/g, "");
 
+    // w:t -> raw text
     inner = inner.replace(/<w:t\b[^>]*>([\s\S]*?)<\/w:t>/g, (_, t) => t ?? "");
 
+    // optional instrText
     inner = inner.replace(
       /<w:instrText\b[^>]*>([\s\S]*?)<\/w:instrText>/g,
       (_, t) => t ?? ""
     );
 
+    // remove remaining tags inside run
     inner = inner.replace(/<[^>]+>/g, "");
 
     if (!inner) return "";
     return hasU ? `<u>${inner}</u>` : inner;
   });
 
+  // 3) Remove remaining tags outside runs, but keep <u>
   x = x.replace(/<(?!\/?u\b)[^>]+>/g, "");
 
+  // 4) Restore tokens in a stable form (use $$ ... $$)
   x = x
     .replace(/___MATH_TOKEN___(.*?)___END___/g, "[!m:$$$1$$]")
     .replace(/___IMG_TOKEN___(.*?)___END___/g, "[!img:$$$1$$]");
@@ -394,6 +388,7 @@ function parseQuestions(text) {
     const [main, solution] = block.split(/Lời giải/i);
     q.solution = solution ? solution.trim() : "";
 
+    // ✅ giữ nguyên thuật toán parse đáp án của bạn
     const choiceRe =
       /(\*?)([A-D])\.\s([\s\S]*?)(?=\n\*?[A-D]\.\s|\nLời giải|$)/g;
 
@@ -444,7 +439,7 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     docXml = imgTok.outXml;
     Object.assign(images, imgTok.imgMap);
 
-    // 3) text ✅ giữ token + underline
+    // 3) text ✅ giờ giữ token + underline
     const text = wordXmlToTextKeepTokens(docXml);
 
     // 4) parse questions ✅ giữ nguyên
@@ -473,19 +468,6 @@ app.get("/debug-inkscape", (_, res) => {
   } catch {
     res.status(500).type("text/plain").send("NO INKSCAPE");
   }
-});
-
-app.get("/debug-mt2mml", (_, res) => {
-  const scriptPath = path.join(__dirname, "mt2mml.rb");
-  let ruby = null;
-  try {
-    ruby = execFileSync("ruby", ["-v"]).toString().trim();
-  } catch {}
-  res.json({
-    ruby,
-    mt2mml_exists: fs.existsSync(scriptPath),
-    mt2mml_path: scriptPath,
-  });
 });
 
 const PORT = process.env.PORT || 3000;
