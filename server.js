@@ -10,6 +10,7 @@ import { MathMLToLaTeX } from "mathml-to-latex";
 
 const app = express();
 app.use(cors());
+app.use(express.json({ limit: "25mb" }));
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -113,22 +114,25 @@ async function maybeConvertEmfWmfToPng(buf, filename) {
 /* ================= MathType OLE -> MathML -> LaTeX ================= */
 
 /**
- * scan MathML embedded directly in OLE (nhanh)
+ * ✅ FIX: scan MathML embedded directly in OLE (nhanh)
+ * - bắt được cả <math> và <m:math> / <mml:math> (namespace prefix)
  */
 function extractMathMLFromOleScan(buf) {
-  const utf8 = buf.toString("utf8");
-  let i = utf8.indexOf("<math");
-  if (i !== -1) {
-    let j = utf8.indexOf("</math>", i);
-    if (j !== -1) return utf8.slice(i, j + 7);
-  }
+  const pickMath = (s) => {
+    if (!s) return null;
+    // match <math> or <prefix:math> ... </math> or </prefix:math>
+    const re = /<([a-zA-Z0-9]+:)?math\b[\s\S]*?<\/\1?math>/i;
+    const m = s.match(re);
+    return m ? m[0] : null;
+  };
 
-  const u16 = buf.toString("utf16le");
-  i = u16.indexOf("<math");
-  if (i !== -1) {
-    let j = u16.indexOf("</math>", i);
-    if (j !== -1) return u16.slice(i, j + 7);
-  }
+  // try utf8
+  let mml = pickMath(buf.toString("utf8"));
+  if (mml) return mml;
+
+  // try utf16le
+  mml = pickMath(buf.toString("utf16le"));
+  if (mml) return mml;
 
   return null;
 }
@@ -157,10 +161,16 @@ function rubyOleToMathML(oleBuf) {
   });
 }
 
+/**
+ * ✅ FIX: normalize namespace prefix trước khi convert để ra căn thức ổn định
+ */
 function mathmlToLatexSafe(mml) {
   try {
-    if (!mml || !mml.includes("<math")) return "";
-    const latex = MathMLToLaTeX.convert(mml);
+    if (!mml) return "";
+    // strip namespace prefix: <m:math> -> <math>, </m:math> -> </math>, etc.
+    const normalized = mml.replace(/<(\/?)([a-zA-Z0-9]+):/g, "<$1");
+    if (!normalized.includes("<math")) return "";
+    const latex = MathMLToLaTeX.convert(normalized);
     return (latex || "").trim();
   } catch {
     return "";
