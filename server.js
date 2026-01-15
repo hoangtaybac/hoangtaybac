@@ -5,7 +5,7 @@ import cors from "cors";
 import fs from "fs";
 import os from "os";
 import path from "path";
-import { execFile } from "child_process";
+import { execFile, execFileSync } from "child_process";
 
 const app = express();
 app.use(cors());
@@ -68,13 +68,14 @@ async function getZipEntryBuffer(zipFiles, p) {
   return await f.buffer();
 }
 
+/* ================= Inkscape Convert ================= */
+
 /**
  * Convert EMF/WMF -> PNG using Inkscape
- * Requires inkscape installed in runtime (Dockerfile below).
+ * Requires inkscape installed in runtime (Dockerfile).
  */
 function inkscapeConvertToPng(inputPath, outputPath) {
   return new Promise((resolve, reject) => {
-    // inkscape in.ext --export-type=png --export-filename=out.png
     execFile(
       "inkscape",
       [inputPath, "--export-type=png", `--export-filename=${outputPath}`],
@@ -101,10 +102,13 @@ async function maybeConvertEmfWmfToPng(buf, filename) {
     const png = fs.readFileSync(outPath);
     return png;
   } finally {
-    // cleanup best-effort
-    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+    try {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    } catch {}
   }
 }
+
+/* ================= MathType Extract ================= */
 
 /**
  * Try extract embedded MathML from MathType OLE binary.
@@ -131,7 +135,8 @@ function extractMathMLFromOle(buf) {
  * MathType FIRST:
  * - Replace <w:object>...<o:OLEObject r:id="...">...</w:object> with [!m:$mathtype_x$]
  * - Extract MathML from oleObject.bin
- * - If no MathML: fallback to preview rid (v:imagedata OR a:blip) and convert EMF/WMF->PNG if needed
+ * - If no MathML: fallback to preview rid (v:imagedata OR a:blip)
+ *   and convert EMF/WMF->PNG if needed
  */
 async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
   let idx = 0;
@@ -147,7 +152,9 @@ async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
     const oleTarget = rels.get(oleRid);
     if (!oleTarget) return block;
 
-    const vmlRid = block.match(/<v:imagedata\b[^>]*\br:id="([^"]+)"[^>]*\/>/);
+    const vmlRid = block.match(
+      /<v:imagedata\b[^>]*\br:id="([^"]+)"[^>]*\/>/
+    );
     const blipRid = block.match(/<a:blip\b[^>]*\br:embed="([^"]+)"[^>]*\/>/);
 
     const previewRid = vmlRid?.[1] || blipRid?.[1] || null;
@@ -181,7 +188,7 @@ async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
           if (imgBuf) {
             const mime = guessMimeFromFilename(imgFull);
 
-            // ✅ convert emf/wmf -> png
+            // convert emf/wmf -> png
             if (mime === "image/emf" || mime === "image/wmf") {
               try {
                 const pngBuf = await maybeConvertEmfWmfToPng(imgBuf, imgFull);
@@ -192,7 +199,7 @@ async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
                   return;
                 }
               } catch (e) {
-                // nếu convert fail, vẫn trả bản gốc để debug
+                // convert fail -> fallthrough return original mime
               }
             }
 
@@ -266,6 +273,8 @@ async function tokenizeImagesAfter(docXml, rels, zipFiles) {
   return { outXml: docXml, imgMap };
 }
 
+/* ================= Text & Questions ================= */
+
 function wordXmlToTextKeepTokens(docXml) {
   let x = docXml
     .replace(/<w:tab\s*\/>/g, "\t")
@@ -313,7 +322,9 @@ function parseQuestions(text) {
     const [main, solution] = block.split(/Lời giải/i);
     q.solution = solution ? solution.trim() : "";
 
-    const choiceRe = /(\*?)([A-D])\.\s([\s\S]*?)(?=\n\*?[A-D]\.\s|\nLời giải|$)/g;
+    const choiceRe =
+      /(\*?)([A-D])\.\s([\s\S]*?)(?=\n\*?[A-D]\.\s|\nLời giải|$)/g;
+
     let m;
     while ((m = choiceRe.exec(main))) {
       const starred = m[1] === "*";
@@ -338,20 +349,23 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     const zip = await unzipper.Open.buffer(req.file.buffer);
 
     const docEntry = zip.files.find((f) => f.path === "word/document.xml");
-    const relEntry = zip.files.find((f) => f.path === "word/_rels/document.xml.rels");
-    if (!docEntry || !relEntry) throw new Error("Missing document.xml or document.xml.rels");
+    const relEntry = zip.files.find(
+      (f) => f.path === "word/_rels/document.xml.rels"
+    );
+    if (!docEntry || !relEntry)
+      throw new Error("Missing document.xml or document.xml.rels");
 
     let docXml = (await docEntry.buffer()).toString("utf8");
     const relsXml = (await relEntry.buffer()).toString("utf8");
     const rels = parseRels(relsXml);
 
-    // ✅ MathType first (and fallback preview + convert emf/wmf -> png)
+    // MathType first (fallback preview + convert emf/wmf -> png)
     const images = {};
     const mathTok = await tokenizeMathTypeOleFirst(docXml, rels, zip.files, images);
     docXml = mathTok.outXml;
     const mathMap = mathTok.mathMap;
 
-    // ✅ Then normal images (also convert emf/wmf -> png)
+    // Then normal images (also convert emf/wmf -> png)
     const imgTok = await tokenizeImagesAfter(docXml, rels, zip.files);
     docXml = imgTok.outXml;
     Object.assign(images, imgTok.imgMap);
@@ -374,9 +388,8 @@ app.post("/upload", upload.single("file"), async (req, res) => {
 });
 
 app.get("/ping", (_, res) => res.send("ok"));
-// THÊM Ở ĐÂY
-import { execFileSync } from "child_process";
 
+/* ✅ Debug inkscape endpoint */
 app.get("/debug-inkscape", (_, res) => {
   try {
     const v = execFileSync("inkscape", ["--version"]).toString();
@@ -385,7 +398,6 @@ app.get("/debug-inkscape", (_, res) => {
     res.status(500).type("text/plain").send("NO INKSCAPE");
   }
 });
-///HẾT THÊM 
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("🚀 Server running on", PORT));
