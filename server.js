@@ -11,61 +11,103 @@ const upload = multer({
   limits: { fileSize: 50 * 1024 * 1024 }
 });
 
-app.post("/upload", upload.single("file"), async (req, res) => {
-  try {
-    const buffer = req.file.buffer;
+/* ================= UTILS ================= */
 
-    // 1️⃣ đọc document.xml dạng STREAM (rất nhanh)
-    const zip = await unzipper.Open.buffer(buffer);
-    const entry = zip.files.find(f => f.path === "word/document.xml");
-    if (!entry) throw new Error("document.xml not found");
+function stripTags(xml) {
+  return xml
+    .replace(/<[^>]+>/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
 
-    let xml = (await entry.buffer()).toString("utf8");
+function extractMath(xml) {
+  let index = 0;
+  const map = {};
+  xml = xml.replace(/<m:oMath[\s\S]*?<\/m:oMath>/g, m => {
+    const key = `mathtype_${++index}`;
+    map[key] = m;
+    return `[!m:$${key}$]`;
+  });
+  return { xml, map };
+}
 
-    // 2️⃣ Token hoá MathType (KHÔNG parse XML)
-    let mathIndex = 0;
-    const mathMap = {};
+function extractImages(xml) {
+  let index = 0;
+  const map = {};
+  xml = xml.replace(/<w:drawing[\s\S]*?<\/w:drawing>/g, m => {
+    const key = `img_${++index}`;
+    map[key] = m;
+    return `[img:$${key}$]`;
+  });
+  return { xml, map };
+}
 
-    xml = xml.replace(/<m:oMath[\s\S]*?<\/m:oMath>/g, (m) => {
-      const key = `mathtype_${++mathIndex}`;
-      mathMap[key] = m;
-      return `[!m:$${key}$]`;
+/* =============== PARSE QUIZ =============== */
+
+function parseQuestions(text) {
+  const blocks = text.split(/(?=Câu\s+\d+\.)/);
+  const questions = [];
+
+  for (const block of blocks) {
+    if (!block.startsWith("Câu")) continue;
+
+    const q = {
+      type: "multiple_choice",
+      content: "",
+      choices: [],
+      correct: null,
+      solution: ""
+    };
+
+    // Lời giải
+    const [main, solution] = block.split(/Lời giải/i);
+    q.solution = solution ? solution.trim() : "";
+
+    // Đáp án
+    main.replace(/\*?([A-D])\.\s([^A-D]*)/g, (m, label, text) => {
+      if (m.startsWith("*")) q.correct = label;
+      q.choices.push({ label, text: text.trim() });
     });
 
-    // 3️⃣ Bóc text Word cơ bản (đủ để làm quiz)
-    const text = xml
-      .replace(/<[^>]+>/g, "")
-      .replace(/\s+/g, " ")
-      .trim();
+    // Nội dung câu hỏi
+    q.content = main.split(/A\./)[0].trim();
 
-    // 4️⃣ Tách câu hỏi (logic giống Azota)
-    const rawQuestions = text.split(/(?=Câu\s+\d+\.)/);
+    questions.push(q);
+  }
 
-    const questions = rawQuestions
-      .filter(q => q.trim().startsWith("Câu"))
-      .map((block, i) => {
-        const answers = [];
-        let correct = null;
+  return questions;
+}
 
-        block.replace(/\*?([A-D])\.\s([^A-D]*)/g, (_, label, content) => {
-          if (_.startsWith("*")) correct = label;
-          answers.push({ label, text: content.trim() });
-        });
+/* ================= API ================= */
 
-        return {
-          id: i + 1,
-          content: block.split(/A\./)[0].trim(),
-          answers,
-          correct
-        };
-      });
+app.post("/upload", upload.single("file"), async (req, res) => {
+  try {
+    const zip = await unzipper.Open.buffer(req.file.buffer);
+    const doc = zip.files.find(f => f.path === "word/document.xml");
+    if (!doc) throw new Error("document.xml not found");
 
-    // 5️⃣ TRẢ JSON – KHÔNG RENDER – RẤT NHANH
+    let xml = (await doc.buffer()).toString("utf8");
+
+    // 1️⃣ MathType → token
+    const mathRes = extractMath(xml);
+    xml = mathRes.xml;
+
+    // 2️⃣ Image → token
+    const imgRes = extractImages(xml);
+    xml = imgRes.xml;
+
+    // 3️⃣ Text
+    const text = stripTags(xml);
+
+    // 4️⃣ Parse quiz
+    const questions = parseQuestions(text);
+
     res.json({
       ok: true,
-      questionCount: questions.length,
+      total: questions.length,
       questions,
-      math: mathMap
+      math: mathRes.map,
+      images: imgRes.map
     });
 
   } catch (err) {
@@ -77,4 +119,6 @@ app.post("/upload", upload.single("file"), async (req, res) => {
 app.get("/ping", (_, res) => res.send("ok"));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("🚀 Server running on", PORT));
+app.listen(PORT, () => {
+  console.log("🚀 Quiz Engine running on port", PORT);
+});
