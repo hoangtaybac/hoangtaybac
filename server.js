@@ -1,8 +1,9 @@
 // server.js
 // ✅ FULL CODE (FIX triệt để mất căn thức trong MathType OLE của CAN THUC.docx)
 // - FIX: OLE scan bắt được cả <math> và <m:math>
-// - FIX: normalize MathML (strip m: prefix + menclose radical -> msqrt)
+// - FIX: normalize MathML (strip m: prefix + menclose radical -> msqrt + mo √ -> msqrt)
 // - FIX: tokenize ALL msqrt/mroot -> placeholder, convert, rồi rebuild \sqrt/\sqrt[n]{}
+// - FIX: restore token robust (token bị tách ký tự + nằm trong \text/\mathrm/\operatorname hoặc trần)
 // - Giữ nguyên thuật toán parse PHẦN/Câu/underline/blocks của bạn
 //
 // Chạy: node server.js
@@ -317,6 +318,29 @@ function postProcessLatex(latex, mathmlMaybe = "") {
 
 /* ================= ✅ RADICAL FIX (Normalize + Tokenize msqrt/mroot) ================= */
 
+// ✅ NEW: helpers for robust token restore
+function escapeRegExp(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+function spacedTokenPattern(token) {
+  return String(token)
+    .split("")
+    .map((ch) => escapeRegExp(ch))
+    .join("\\s*");
+}
+function tokenRegex(token) {
+  const p = spacedTokenPattern(token);
+  return new RegExp(
+    [
+      `\\\\text\\s*\\{\\s*${p}\\s*\\}`,
+      `\\\\mathrm\\s*\\{\\s*${p}\\s*\\}`,
+      `\\\\operatorname\\s*\\{\\s*${p}\\s*\\}`,
+      `${p}`,
+    ].join("|"),
+    "g"
+  );
+}
+
 function normalizeMathML(mml = "") {
   let s = String(mml || "");
 
@@ -335,6 +359,13 @@ function normalizeMathML(mml = "") {
 
   // Some MathType variants omit notation
   s = s.replace(/<\s*menclose\b[^>]*>/gi, "<msqrt>");
+
+  // ✅ NEW: mo √ + mrow ... => msqrt(mrow ...)
+  // covers: √, &#8730; &#x221A; &radic;
+  s = s.replace(
+    /<\s*mo\b[^>]*>\s*(?:√|&#8730;|&#x221a;|&#x221A;|&radic;)\s*<\s*\/\s*mo\s*>\s*<\s*mrow\b[^>]*>([\s\S]*?)<\s*\/\s*mrow\s*>/gi,
+    "<msqrt><mrow>$1</mrow></msqrt>"
+  );
 
   return s;
 }
@@ -448,7 +479,7 @@ function mathmlToLatexSafe(mml) {
     let latex = (MathMLToLaTeX.convert(tokMml) || "").trim();
     latex = postProcessLatex(latex, tokMml);
 
-    // Replace tokens back to sqrt/root latex
+    // ✅ NEW: Replace tokens back robust (token tách ký tự + wrappers)
     for (const [token, info] of Object.entries(map)) {
       let repl = "";
 
@@ -475,9 +506,7 @@ function mathmlToLatexSafe(mml) {
           : `\\sqrt{${baseL || ""}}`;
       }
 
-      // replace raw token and also token inside \text{...}
-      const re = new RegExp(`(\\\\text\\{\\s*)?${token}(\\s*\\})?`, "g");
-      latex = latex.replace(re, repl);
+      latex = latex.replace(tokenRegex(token), repl);
     }
 
     return String(latex || "").replace(/\s+/g, " ").trim();
