@@ -25,7 +25,7 @@ COPY package.json package-lock.json* ./
 RUN npm install --production
 
 # Copy application source
-COPY server.js mt2mml.rb mt2mml_v2.rb mt2mml_worker.rb ./
+COPY server.js mt2mml.rb mt2mml_v2.rb ./
 
 # Environment
 ENV NODE_ENV=production
