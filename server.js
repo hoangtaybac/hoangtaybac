@@ -4,6 +4,11 @@
 // - Server trả thêm `blocks` đã trộn (section + question) đúng thứ tự để frontend render chuẩn.
 // - ✅ NEW: Giữ được bảng <w:tbl> và nội dung trong bảng (kể cả underline + token math/img)
 //
+// ✅ FIX MẤT CĂN THỨC (MathType OLE):
+// - Normalize MathML: strip prefix m: / o: , decode entities, menclose radical -> msqrt
+// - Normalize "mo √ ..." -> msqrt wrap (các pattern thường gặp)
+// - HARD FIX: nếu MathML có căn mà LaTeX convert ra KHÔNG có \sqrt/\root => bọc \sqrt{...} (không còn mất căn)
+//
 // Chạy: node server.js
 // Yêu cầu: inkscape (convert emf/wmf), ruby + mt2mml.rb (fallback MathType)
 // npm i express multer unzipper cors mathml-to-latex
@@ -161,9 +166,61 @@ function rubyOleToMathML(oleBuf) {
   });
 }
 
-/* ================== LATEX POSTPROCESS ================== */
+/* ================== ✅ MathML NORMALIZE (FIX MẤT CĂN) ================== */
 
-const SQRT_MATHML_RE = /(msqrt|mroot|√|&#8730;|&#x221a;|&#x221A;|&radic;)/i;
+const SQRT_MATHML_RE = /(msqrt|mroot|menclose[^>]*notation\s*=\s*["']radical["']|√|&#8730;|&#x221a;|&#x221A;|&radic;)/i;
+
+function stripMathmlNamespacePrefixes(mml) {
+  // strip prefixes like <m:math> <m:msqrt> </m:msqrt> etc.
+  // keep attributes as-is (r:id etc not in MathML anyway)
+  return String(mml || "")
+    .replace(/<\/\s*[a-zA-Z0-9_]+\s*:/g, "</") // </m:tag> -> </tag>
+    .replace(/<\s*[a-zA-Z0-9_]+\s*:/g, "<");  // <m:tag  -> <tag
+}
+
+function normalizeMencloseRadicalToMsqrt(mml) {
+  // Convert: <menclose notation="radical">X</menclose> -> <msqrt>X</msqrt>
+  // Some MathType variants may have additional attributes.
+  return String(mml || "").replace(
+    /<menclose\b([^>]*)\bnotation\s*=\s*["']radical["']([^>]*)>([\s\S]*?)<\/menclose>/gi,
+    (_m, a, b, inner) => `<msqrt>${inner}</msqrt>`
+  );
+}
+
+function normalizeMoRadicalToMsqrt(mml) {
+  // Convert patterns: <mo>√</mo><mrow>...</mrow>  OR <mo>&#8730;</mo><mi>x</mi> etc.
+  // Only wraps the immediate next element (common in MathType exports).
+  const RAD = "(?:√|&#8730;|&#x221a;|&#x221A;|&radic;)";
+  const NEXT =
+    "(<mrow\\b[\\s\\S]*?<\\/mrow>|<mi\\b[\\s\\S]*?<\\/mi>|<mn\\b[\\s\\S]*?<\\/mn>|<msup\\b[\\s\\S]*?<\\/msup>|<msub\\b[\\s\\S]*?<\\/msub>|<msubsup\\b[\\s\\S]*?<\\/msubsup>|<mfrac\\b[\\s\\S]*?<\\/mfrac>|<msqrt\\b[\\s\\S]*?<\\/msqrt>|<mroot\\b[\\s\\S]*?<\\/mroot>)";
+
+  const re = new RegExp(`<mo\\b[^>]*>\\s*${RAD}\\s*<\\/mo>\\s*${NEXT}`, "gi");
+  return String(mml || "").replace(re, (_m, nextNode) => `<msqrt>${nextNode}</msqrt>`);
+}
+
+function normalizeMathMLForConverter(mml) {
+  let s = String(mml || "").trim();
+  if (!s) return "";
+
+  // Decode entities first (to catch √, etc.)
+  s = decodeXmlEntities(s);
+
+  // Strip namespaces (m:)
+  s = stripMathmlNamespacePrefixes(s);
+
+  // Ensure we have <math> wrapper if MathType gave fragments
+  if (!/<\s*math\b/i.test(s)) {
+    s = `<math xmlns="http://www.w3.org/1998/Math/MathML">${s}</math>`;
+  }
+
+  // Radical normalizations
+  s = normalizeMencloseRadicalToMsqrt(s);
+  s = normalizeMoRadicalToMsqrt(s);
+
+  return s;
+}
+
+/* ================== LATEX POSTPROCESS ================== */
 
 function sanitizeLatexStrict(latex) {
   if (!latex) return latex;
@@ -298,16 +355,21 @@ function fixPiecewiseFunction(latex) {
 }
 
 function fixSqrtLatex(latex, mathmlMaybe = "") {
-  let s = String(latex || "");
+  let s = String(latex || "").trim();
 
+  // normalize stray unicode radical forms if any slipped through
   s = s.replace(/√\s*\(\s*([\s\S]*?)\s*\)/g, "\\sqrt{$1}");
   s = s.replace(/√\s*([A-Za-z0-9]+)\b/g, "\\sqrt{$1}");
 
-  if (SQRT_MATHML_RE.test(String(mathmlMaybe || ""))) {
-    const hasSqrt = /\\sqrt\b|\\root\b/.test(s);
-    if (!hasSqrt && s) {
-      s = s.replace(/\bradic\b/gi, "\\sqrt{}");
-    }
+  const mml = String(mathmlMaybe || "");
+  const hasRadicalInMml = SQRT_MATHML_RE.test(mml);
+  const hasSqrtInLatex = /\\sqrt\b|\\root\b/.test(s);
+
+  // ✅ HARD FIX: nếu MathML có căn nhưng LaTeX không có \sqrt => bọc \sqrt{...}
+  // (nguyên nhân hay gặp: menclose radical / namespace / mo √)
+  if (hasRadicalInMml && !hasSqrtInLatex && s) {
+    // tránh bọc nếu đã là nhóm {} lớn
+    s = `\\sqrt{${s}}`;
   }
 
   return s;
@@ -325,9 +387,14 @@ function postProcessLatex(latex, mathmlMaybe = "") {
 
 function mathmlToLatexSafe(mml) {
   try {
-    if (!mml || !mml.includes("<math")) return "";
-    const latex0 = (MathMLToLaTeX.convert(mml) || "").trim();
-    return postProcessLatex(latex0, mml);
+    if (!mml) return "";
+
+    // ✅ Normalize MathML first (FIX mất căn)
+    const norm = normalizeMathMLForConverter(mml);
+    if (!norm || !norm.includes("<math")) return "";
+
+    const latex0 = (MathMLToLaTeX.convert(norm) || "").trim();
+    return postProcessLatex(latex0, norm);
   } catch {
     return "";
   }
