@@ -1,10 +1,8 @@
 // server.js
-// ✅ FULL CODE (FIX: tiêu đề PHẦN đúng vị trí như file Word gốc)
-// ✅ FIX MẤT CĂN THỨC MathType:
-//   (1) Decode MathML bị escape (&lt;math ...&gt;) trước khi convert LaTeX
-//   (2) Cắt MathML từ <math>...</math> nếu stdout có rác
-//   (3) Giới hạn concurrency khi gọi ruby (ổn định hơn, không timeout rớt công thức)
-//   (4) Nếu LaTeX rỗng nhưng có preview image => tự đổi token math thành img token ngay tại chỗ (frontend không cần sửa)
+// ✅ FULL CODE (FIX: PHẦN đúng vị trí + FIX mất căn thức \sqrt)
+// - Server trả `blocks` đã trộn section + question đúng thứ tự (frontend render chuẩn như Word)
+// - MathType OLE -> MathML -> LaTeX
+// - FIX HARD: nếu MathML có msqrt/mroot nhưng LaTeX bị rơi \sqrt => tự bọc \sqrt{...}
 //
 // Chạy: node server.js
 // Yêu cầu: inkscape (convert emf/wmf), ruby + mt2mml.rb (fallback MathType)
@@ -63,7 +61,7 @@ function guessMimeFromFilename(filename = "") {
 }
 
 function decodeXmlEntities(s = "") {
-  return String(s || "")
+  return s
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
     .replace(/&amp;/g, "&")
@@ -79,21 +77,6 @@ async function getZipEntryBuffer(zipFiles, p) {
   const f = zipFiles.find((x) => x.path === p);
   if (!f) return null;
   return await f.buffer();
-}
-
-/* ======= Small concurrency limiter (ổn định ruby, không rớt công thức) ======= */
-async function mapLimit(items, limit, worker) {
-  const ret = new Array(items.length);
-  let i = 0;
-  const runners = Array.from({ length: Math.max(1, limit) }, async () => {
-    while (true) {
-      const cur = i++;
-      if (cur >= items.length) break;
-      ret[cur] = await worker(items[cur], cur);
-    }
-  });
-  await Promise.all(runners);
-  return ret;
 }
 
 /* ================= Inkscape Convert EMF/WMF -> PNG ================= */
@@ -314,17 +297,26 @@ function fixPiecewiseFunction(latex) {
   return s;
 }
 
+/**
+ * ✅ FIX MẤT CĂN THỨC:
+ * Nếu MathML có msqrt/mroot nhưng converter trả về latex bị rơi \sqrt => bọc lại \sqrt{...}
+ */
 function fixSqrtLatex(latex, mathmlMaybe = "") {
-  let s = String(latex || "");
+  let s = String(latex || "").trim();
+  const mml = String(mathmlMaybe || "");
 
+  // Convert literal sqrt symbol if it survived into LaTeX string
   s = s.replace(/√\s*\(\s*([\s\S]*?)\s*\)/g, "\\sqrt{$1}");
   s = s.replace(/√\s*([A-Za-z0-9]+)\b/g, "\\sqrt{$1}");
 
-  if (SQRT_MATHML_RE.test(String(mathmlMaybe || ""))) {
-    const hasSqrt = /\\sqrt\b|\\root\b/.test(s);
-    if (!hasSqrt && s) {
-      s = s.replace(/\bradic\b/gi, "\\sqrt{}");
-    }
+  const mmlHasSqrt =
+    SQRT_MATHML_RE.test(mml) || /<msqrt\b/i.test(mml) || /<mroot\b/i.test(mml);
+  const latexHasSqrt = /\\sqrt\b|\\root\b/.test(s);
+
+  // HARD WRAP
+  if (mmlHasSqrt && !latexHasSqrt) {
+    if (!s) return "\\sqrt{}";
+    return `\\sqrt{${s}}`;
   }
 
   return s;
@@ -354,7 +346,7 @@ function mathmlToLatexSafe(mml) {
 
 async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
   let idx = 0;
-  const found = {};
+  const found = {}; // key -> { oleTarget, previewRid }
   const OBJECT_RE = /<w:object[\s\S]*?<\/w:object>/g;
 
   docXml = docXml.replace(OBJECT_RE, (block) => {
@@ -365,8 +357,12 @@ async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
     const oleTarget = rels.get(oleRid);
     if (!oleTarget) return block;
 
-    const vmlRid = block.match(/<v:imagedata\b[^>]*\br:id="([^"]+)"[^>]*\/>/);
-    const blipRid = block.match(/<a:blip\b[^>]*\br:embed="([^"]+)"[^>]*\/>/);
+    const vmlRid = block.match(
+      /<v:imagedata\b[^>]*\br:id="([^"]+)"[^>]*\/>/
+    );
+    const blipRid = block.match(
+      /<a:blip\b[^>]*\br:embed="([^"]+)"[^>]*\/>/
+    );
     const previewRid = vmlRid?.[1] || blipRid?.[1] || null;
 
     const key = `mathtype_${++idx}`;
@@ -376,84 +372,60 @@ async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
 
   const latexMap = {};
 
-  const entries = Object.entries(found);
+  await Promise.all(
+    Object.entries(found).map(async ([key, info]) => {
+      const oleFull = normalizeTargetToWordPath(info.oleTarget);
+      const oleBuf = await getZipEntryBuffer(zipFiles, oleFull);
 
-  // ✅ FIX: giới hạn số process ruby chạy song song (tránh timeout/rớt công thức)
-  await mapLimit(entries, 4, async ([key, info]) => {
-    const oleFull = normalizeTargetToWordPath(info.oleTarget);
-    const oleBuf = await getZipEntryBuffer(zipFiles, oleFull);
+      let mml = "";
+      if (oleBuf) mml = extractMathMLFromOleScan(oleBuf) || "";
 
-    let mml = "";
-    if (oleBuf) mml = extractMathMLFromOleScan(oleBuf) || "";
-
-    if (!mml && oleBuf) {
-      try {
-        mml = await rubyOleToMathML(oleBuf);
-      } catch {
-        mml = "";
-      }
-    }
-
-    // ✅ FIX: ruby có thể trả &lt;math...&gt; => decode
-    mml = (mml || "").trim();
-    if (mml && !mml.includes("<math") && mml.includes("&lt;math")) {
-      mml = decodeXmlEntities(mml);
-    }
-
-    // ✅ FIX: cắt phần <math>...</math> nếu có rác trước/sau
-    if (mml && !mml.startsWith("<math")) {
-      const i = mml.indexOf("<math");
-      const j = mml.indexOf("</math>");
-      if (i !== -1 && j !== -1) mml = mml.slice(i, j + 7);
-    }
-
-    const latex = mml ? mathmlToLatexSafe(mml) : "";
-    if (latex) {
-      latexMap[key] = latex;
-      return;
-    }
-
-    // fallback preview image
-    if (info.previewRid) {
-      const t = rels.get(info.previewRid);
-      if (t) {
-        const imgFull = normalizeTargetToWordPath(t);
-        const imgBuf = await getZipEntryBuffer(zipFiles, imgFull);
-        if (imgBuf) {
-          const mime = guessMimeFromFilename(imgFull);
-          if (mime === "image/emf" || mime === "image/wmf") {
-            try {
-              const pngBuf = await maybeConvertEmfWmfToPng(imgBuf, imgFull);
-              if (pngBuf) {
-                images[`fallback_${key}`] = `data:image/png;base64,${pngBuf.toString(
-                  "base64"
-                )}`;
-                latexMap[key] = "";
-                return;
-              }
-            } catch {}
-          }
-          images[`fallback_${key}`] = `data:${mime};base64,${imgBuf.toString(
-            "base64"
-          )}`;
+      if (!mml && oleBuf) {
+        try {
+          mml = await rubyOleToMathML(oleBuf);
+        } catch {
+          mml = "";
         }
       }
-    }
 
-    latexMap[key] = "";
-  });
+      const latex = mml ? mathmlToLatexSafe(mml) : "";
+      if (latex) {
+        latexMap[key] = latex;
+        return;
+      }
 
-  // ✅ FIX: nếu latex rỗng nhưng có ảnh fallback => đổi token math thành img token ngay tại vị trí công thức
-  let outXml = docXml;
-  for (const key of Object.keys(found)) {
-    const fbKey = `fallback_${key}`;
-    if (!latexMap[key] && images[fbKey]) {
-      outXml = outXml.replaceAll(`[!m:$$${key}$$]`, `[!img:$$${fbKey}$$]`);
-      outXml = outXml.replaceAll(`[!m:$${key}$]`, `[!img:$$${fbKey}$$]`);
-    }
-  }
+      // fallback preview image
+      if (info.previewRid) {
+        const t = rels.get(info.previewRid);
+        if (t) {
+          const imgFull = normalizeTargetToWordPath(t);
+          const imgBuf = await getZipEntryBuffer(zipFiles, imgFull);
+          if (imgBuf) {
+            const mime = guessMimeFromFilename(imgFull);
+            if (mime === "image/emf" || mime === "image/wmf") {
+              try {
+                const pngBuf = await maybeConvertEmfWmfToPng(imgBuf, imgFull);
+                if (pngBuf) {
+                  images[`fallback_${key}`] = `data:image/png;base64,${pngBuf.toString(
+                    "base64"
+                  )}`;
+                  latexMap[key] = "";
+                  return;
+                }
+              } catch {}
+            }
+            images[`fallback_${key}`] = `data:${mime};base64,${imgBuf.toString(
+              "base64"
+            )}`;
+          }
+        }
+      }
 
-  return { outXml, latexMap };
+      latexMap[key] = "";
+    })
+  );
+
+  return { outXml: docXml, latexMap };
 }
 
 /* ================= Images AFTER MathType ================= */
@@ -558,10 +530,7 @@ function wordXmlToTextKeepTokens(docXml) {
 }
 
 /* ================= SECTION TITLES (PHẦN ...) ================= */
-/**
- * Trả về sections theo VỊ TRÍ ký tự (startChar/endChar) + index câu toàn cục.
- * Không lệch khi mỗi PHẦN reset "Câu 1."
- */
+
 function extractSectionTitles(rawText) {
   const text = String(rawText || "").replace(/\r/g, "");
 
@@ -620,8 +589,8 @@ function extractSectionTitles(rawText) {
       }
     }
 
-    sec.questionIndexStart = startIdx; // 0-based
-    sec.questionIndexEnd = endIdx; // slice end
+    sec.questionIndexStart = startIdx;
+    sec.questionIndexEnd = endIdx;
     sec.questionCount = endIdx - startIdx;
     sec.firstQuestionNo = qAnchors[startIdx]?.no ?? null;
   }
@@ -911,11 +880,8 @@ function attachSectionOrderToQuestions(exam, sections) {
   }
 }
 
-/* ================= ✅ FIX UI: BUILD BLOCKS (SECTION + QUESTION) đúng thứ tự ================= */
-/**
- * Nếu frontend render `sections` riêng ở đầu trang => sẽ bị như ảnh của bạn.
- * => Tạo `blocks` đã TRỘN sẵn để frontend chỉ render theo blocks.
- */
+/* ================= ✅ blocks trộn section + question đúng thứ tự ================= */
+
 function buildOrderedBlocks(exam) {
   const blocks = [];
   let lastSec = null;
@@ -968,13 +934,11 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     // 3) text (giữ token + underline)
     const text = wordXmlToTextKeepTokens(docXml);
 
-    // 4) parse exam output (GIỮ NGUYÊN)
+    // 4) parse exam output
     const exam = parseExamFromText(text);
 
     // sections theo vị trí + index câu toàn cục
     const sections = extractSectionTitles(text);
-
-    // thêm vào exam
     exam.sections = sections;
 
     // gán sectionOrder/sectionTitle cho từng question
@@ -983,19 +947,14 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     // ✅ blocks đã trộn đúng thứ tự để frontend render chuẩn như Word
     const blocks = buildOrderedBlocks(exam);
 
-    // legacy
+    // legacy (để tương thích)
     const questions = legacyQuestionsFromExam(exam);
 
     res.json({
       ok: true,
       total: exam.questions.length,
-
-      // Nếu vẫn cần, vẫn trả sections (để debug)
       sections,
-
-      // ✅ QUAN TRỌNG: frontend hãy dùng blocks
       blocks,
-
       exam,
       questions,
       latex: latexMap,
