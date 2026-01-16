@@ -4,6 +4,10 @@
 // - Server trả thêm `blocks` đã trộn (section + question) đúng thứ tự để frontend render chuẩn.
 // - ✅ NEW: Giữ được bảng <w:tbl> và nội dung trong bảng (kể cả underline + token math/img)
 //
+// ✅ FIX ẢNH BỊ THIẾU (Câu 7, Câu 11):
+// - Bắt thêm <a:blip ...> (không tự đóng) ngoài <a:blip .../>
+// - Bắt thêm cả r:link (một số doc dùng link thay vì embed)
+//
 // Chạy: node server.js
 // Yêu cầu: inkscape (convert emf/wmf), ruby + mt2mml.rb (fallback MathType)
 // npm i express multer unzipper cors mathml-to-latex
@@ -447,8 +451,9 @@ async function tokenizeImagesAfter(docXml, rels, zipFiles) {
     );
   };
 
+  // ✅ FIX DUY NHẤT: bắt cả <a:blip .../> và <a:blip ...> + cả r:embed và r:link
   docXml = docXml.replace(
-    /<a:blip\b[^>]*\br:embed="([^"]+)"[^>]*\/>/g,
+    /<a:blip\b[^>]*\br:(?:embed|link)="([^"]+)"[^>]*\/?>/g,
     (m, rid) => {
       const key = `img_${++idx}`;
       schedule(rid, key);
@@ -602,6 +607,7 @@ function wordXmlToTextKeepTokens(docXml) {
 
   return x;
 }
+
 /* ================= SECTION TITLES (PHẦN ...) ================= */
 /**
  * ✅ FIX: lấy ĐẦY ĐỦ tiêu đề PHẦN nhiều dòng/ nhiều đoạn trong Word
