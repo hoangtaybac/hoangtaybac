@@ -1,11 +1,9 @@
 // server.js
-// ✅ FULL CODE (FIX: tiêu đề PHẦN đúng vị trí như file Word gốc + FIX mất căn thức \sqrt)
-// - Không lệch khi mỗi PHẦN reset "Câu 1."
-// - Server trả thêm `blocks` đã trộn (section + question) đúng thứ tự để frontend render chuẩn.
-// - MathType OLE -> MathML -> LaTeX
-// - FIX: strip namespace prefix m: (m:math / m:msqrt / m:mroot...) để converter nhận đúng
-// - FIX: menclose notation="radical" => msqrt
-// - FIX: nếu MathML có radical nhưng latex bị rơi \sqrt => HARD rebuild sqrt/root từ MathML
+// ✅ FULL CODE (FIX triệt để mất căn thức trong MathType OLE của CAN THUC.docx)
+// - FIX: OLE scan bắt được cả <math> và <m:math>
+// - FIX: normalize MathML (strip m: prefix + menclose radical -> msqrt)
+// - FIX: tokenize ALL msqrt/mroot -> placeholder, convert, rồi rebuild \sqrt/\sqrt[n]{}
+// - Giữ nguyên thuật toán parse PHẦN/Câu/underline/blocks của bạn
 //
 // Chạy: node server.js
 // Yêu cầu: inkscape (convert emf/wmf), ruby + mt2mml.rb (fallback MathType)
@@ -125,20 +123,30 @@ async function maybeConvertEmfWmfToPng(buf, filename) {
 
 /* ================= MathType OLE -> MathML -> LaTeX ================= */
 
+// ✅ FIX: bắt được cả <math> và <m:math> (và các prefix khác)
 function extractMathMLFromOleScan(buf) {
-  const utf8 = buf.toString("utf8");
-  let i = utf8.indexOf("<math");
-  if (i !== -1) {
-    let j = utf8.indexOf("</math>", i);
-    if (j !== -1) return utf8.slice(i, j + 7);
-  }
+  const tryFind = (str) => {
+    if (!str) return null;
 
-  const u16 = buf.toString("utf16le");
-  i = u16.indexOf("<math");
-  if (i !== -1) {
-    let j = u16.indexOf("</math>", i);
-    if (j !== -1) return u16.slice(i, j + 7);
-  }
+    const s = decodeXmlEntities(String(str));
+
+    const open = s.search(/<\s*(?:[A-Za-z0-9_]+:)?math\b/i);
+    if (open === -1) return null;
+
+    const closeRe = /<\/\s*(?:[A-Za-z0-9_]+:)?math\s*>/ig;
+    closeRe.lastIndex = open;
+    const m = closeRe.exec(s);
+    if (!m) return null;
+
+    const end = m.index + m[0].length;
+    return s.slice(open, end);
+  };
+
+  let out = tryFind(buf.toString("utf8"));
+  if (out) return out;
+
+  out = tryFind(buf.toString("utf16le"));
+  if (out) return out;
 
   return null;
 }
@@ -165,33 +173,6 @@ function rubyOleToMathML(oleBuf) {
 }
 
 /* ================== LATEX POSTPROCESS ================== */
-
-// Detect sqrt in MathML (covers msqrt/mroot + menclose radical + entities)
-const SQRT_MATHML_RE =
-  /(<\s*msqrt\b|<\s*mroot\b|<\s*menclose\b[^>]*notation\s*=\s*["']radical["']|√|&#8730;|&#x221a;|&#x221A;|&radic;)/i;
-
-// 1) Strip namespace prefixes like <m:msqrt> -> <msqrt>, </m:msqrt> -> </msqrt>
-// 2) Convert <menclose notation="radical">...</menclose> -> <msqrt>...</msqrt>
-// 3) Strip prefixed attributes (rare)
-function normalizeMathML(mml = "") {
-  let s = String(mml || "");
-
-  // remove tag prefixes: <m:tag ...> or </m:tag>
-  s = s.replace(/<\s*(\/?)\s*([A-Za-z0-9_]+):/g, "<$1");
-
-  // remove attribute prefixes: m:attr="..." -> attr="..."
-  s = s.replace(/(\s)[A-Za-z0-9_]+:([A-Za-z0-9_\-]+)=/g, "$1$2=");
-
-  // menclose radical => msqrt
-  s = s.replace(
-    /<\s*menclose\b[^>]*notation\s*=\s*["']radical["'][^>]*>/gi,
-    "<msqrt>"
-  );
-  s = s.replace(/<\s*menclose\b[^>]*>/gi, "<msqrt>");
-  s = s.replace(/<\s*\/\s*menclose\s*>/gi, "</msqrt>");
-
-  return s;
-}
 
 function sanitizeLatexStrict(latex) {
   if (!latex) return latex;
@@ -325,47 +306,51 @@ function fixPiecewiseFunction(latex) {
   return s;
 }
 
-function fixSqrtLatex(latex, mathmlMaybe = "") {
-  let s = String(latex || "");
-
-  // Some weird cases might leave a literal sqrt sign
-  s = s.replace(/√\s*\(\s*([\s\S]*?)\s*\)/g, "\\sqrt{$1}");
-  s = s.replace(/√\s*([A-Za-z0-9]+)\b/g, "\\sqrt{$1}");
-
-  // If MathML indicates radical but converter returns something like "radic"
-  if (SQRT_MATHML_RE.test(String(mathmlMaybe || ""))) {
-    const hasSqrt = /\\sqrt\b|\\root\b/.test(s);
-    if (!hasSqrt && s) {
-      s = s.replace(/\bradic\b/gi, "\\sqrt{}");
-    }
-  }
-
-  return s;
-}
-
 function postProcessLatex(latex, mathmlMaybe = "") {
   let s = latex || "";
   s = sanitizeLatexStrict(s);
   s = fixSetBracesHard(s);
   s = restoreArrowAndCoreCommands(s);
   s = fixPiecewiseFunction(s);
-  s = fixSqrtLatex(s, mathmlMaybe);
   return String(s || "").replace(/\s+/g, " ").trim();
 }
 
-/* ================= HARD sqrt/root fallback from MathML ================= */
+/* ================= ✅ RADICAL FIX (Normalize + Tokenize msqrt/mroot) ================= */
 
-function extractFirstTagInner(xml, tag) {
-  const s = String(xml || "");
-  const openRe = new RegExp(`<\\s*${tag}\\b[^>]*>`, "i");
+function normalizeMathML(mml = "") {
+  let s = String(mml || "");
+
+  // <m:msqrt> -> <msqrt>, </m:msqrt> -> </msqrt>
+  s = s.replace(/<\s*(\/?)\s*([A-Za-z0-9_]+):/g, "<$1");
+
+  // m:attr="..." -> attr="..."
+  s = s.replace(/(\s)[A-Za-z0-9_]+:([A-Za-z0-9_\-]+)=/g, "$1$2=");
+
+  // menclose radical => msqrt
+  s = s.replace(
+    /<\s*menclose\b[^>]*notation\s*=\s*["']radical["'][^>]*>/gi,
+    "<msqrt>"
+  );
+  s = s.replace(/<\s*\/\s*menclose\s*>/gi, "</msqrt>");
+
+  // Some MathType variants omit notation
+  s = s.replace(/<\s*menclose\b[^>]*>/gi, "<msqrt>");
+
+  return s;
+}
+
+function extractTagBlock(s, tag, fromIdx) {
+  const openRe = new RegExp(`<\\s*${tag}\\b[^>]*>`, "ig");
+  openRe.lastIndex = fromIdx;
   const m = openRe.exec(s);
   if (!m) return null;
 
-  const startOpen = m.index;
-  const startInner = startOpen + m[0].length;
+  const start = m.index;
+  const openLen = m[0].length;
+  const innerStart = start + openLen;
 
   const anyTagRe = /<\s*\/?\s*[A-Za-z0-9_]+\b[^>]*>/g;
-  anyTagRe.lastIndex = startInner;
+  anyTagRe.lastIndex = innerStart;
 
   let depth = 1;
   let mm;
@@ -373,22 +358,23 @@ function extractFirstTagInner(xml, tag) {
   while ((mm = anyTagRe.exec(s)) !== null) {
     const t = mm[0];
     const isClose = /^<\s*\//.test(t);
+    const name = (
+      t.match(/^<\s*\/?\s*([A-Za-z0-9_]+)/)?.[1] || ""
+    ).toLowerCase();
 
-    const nameMatch = t.match(/^<\s*\/?\s*([A-Za-z0-9_]+)/);
-    const name = nameMatch ? nameMatch[1].toLowerCase() : "";
-
-    if (name !== String(tag).toLowerCase()) continue;
+    if (name !== tag.toLowerCase()) continue;
 
     if (!isClose) depth++;
     else depth--;
 
     if (depth === 0) {
-      const endInner = mm.index;
-      return s.slice(startInner, endInner);
+      const end = mm.index + t.length;
+      const inner = s.slice(innerStart, mm.index);
+      return { start, end, inner };
     }
   }
 
-  return s.slice(startInner);
+  return { start, end: s.length, inner: s.slice(innerStart) };
 }
 
 function splitTopLevelChildren(inner) {
@@ -407,61 +393,75 @@ function splitTopLevelChildren(inner) {
     const isClose = /^<\s*\//.test(tag);
     const isSelfClose = /\/\s*>$/.test(tag);
 
-    if (!isClose && !isSelfClose) {
-      if (depth === 0 && m.index > last) {
-        const txt = s.slice(last, m.index).trim();
-        if (txt) parts.push(txt);
-        last = m.index;
-      }
-      depth++;
-    } else if (isClose) {
-      depth = Math.max(0, depth - 1);
-      if (depth === 0) {
-        const segEnd = m.index + tag.length;
-        const seg = s.slice(last, segEnd).trim();
-        if (seg) parts.push(seg);
-        last = segEnd;
-      }
-    } else {
-      // self close at top-level
-      if (depth === 0) {
-        const segEnd = m.index + tag.length;
-        const seg = s.slice(last, segEnd).trim();
-        if (seg) parts.push(seg);
-        last = segEnd;
-      }
+    if (!isClose && !isSelfClose) depth++;
+    else if (isClose) depth = Math.max(0, depth - 1);
+
+    if (depth === 0) {
+      const segEnd = m.index + tag.length;
+      const seg = s.slice(last, segEnd).trim();
+      if (seg) parts.push(seg);
+      last = segEnd;
     }
   }
 
   const tail = s.slice(last).trim();
   if (tail) parts.push(tail);
-
   return parts;
 }
 
-function hardSqrtFromMathML(normMml) {
-  const mml = String(normMml || "");
-  if (!mml.includes("<math")) return "";
+function tokenizeRadicals(normMathML) {
+  let s = String(normMathML || "");
+  const map = {};
+  let i = 0;
 
-  // msqrt
-  if (/<\s*msqrt\b/i.test(mml)) {
-    const inner = extractFirstTagInner(mml, "msqrt");
-    if (inner != null) {
-      const wrapped = `<math>${inner}</math>`;
-      const innerLatex = (MathMLToLaTeX.convert(wrapped) || "").trim();
-      const fixedInner = postProcessLatex(innerLatex, wrapped);
-      return fixedInner ? `\\sqrt{${fixedInner}}` : "\\sqrt{}";
-    }
+  // tokenize all msqrt
+  for (;;) {
+    const blk = extractTagBlock(s, "msqrt", 0);
+    if (!blk) break;
+    const token = `__SQRT${i++}__`;
+    map[token] = { kind: "sqrt", inner: blk.inner };
+    s = s.slice(0, blk.start) + `<mtext>${token}</mtext>` + s.slice(blk.end);
   }
 
-  // mroot: order base then index in MathML
-  if (/<\s*mroot\b/i.test(mml)) {
-    const inner = extractFirstTagInner(mml, "mroot");
-    if (inner != null) {
-      const kids = splitTopLevelChildren(inner);
-      if (kids.length >= 2) {
-        const baseM = `<math>${kids[0]}</math>`;
-        const idxM = `<math>${kids[1]}</math>`;
+  // tokenize all mroot
+  for (;;) {
+    const blk = extractTagBlock(s, "mroot", 0);
+    if (!blk) break;
+    const token = `__ROOT${i++}__`;
+    const kids = splitTopLevelChildren(blk.inner);
+    map[token] = { kind: "root", base: kids[0] || "", idx: kids[1] || "" };
+    s = s.slice(0, blk.start) + `<mtext>${token}</mtext>` + s.slice(blk.end);
+  }
+
+  return { mml: s, map };
+}
+
+function mathmlToLatexSafe(mml) {
+  try {
+    if (!mml || !String(mml).includes("math")) return "";
+
+    const norm = normalizeMathML(mml);
+
+    // ✅ tokenize radicals => converter không thể làm rơi dấu căn
+    const { mml: tokMml, map } = tokenizeRadicals(norm);
+
+    let latex = (MathMLToLaTeX.convert(tokMml) || "").trim();
+    latex = postProcessLatex(latex, tokMml);
+
+    // Replace tokens back to sqrt/root latex
+    for (const [token, info] of Object.entries(map)) {
+      let repl = "";
+
+      if (info.kind === "sqrt") {
+        const innerM = `<math>${info.inner}</math>`;
+        const innerL = postProcessLatex(
+          (MathMLToLaTeX.convert(innerM) || "").trim(),
+          innerM
+        );
+        repl = `\\sqrt{${innerL || ""}}`;
+      } else {
+        const baseM = `<math>${info.base}</math>`;
+        const idxM = `<math>${info.idx}</math>`;
         const baseL = postProcessLatex(
           (MathMLToLaTeX.convert(baseM) || "").trim(),
           baseM
@@ -470,32 +470,17 @@ function hardSqrtFromMathML(normMml) {
           (MathMLToLaTeX.convert(idxM) || "").trim(),
           idxM
         );
-        if (baseL && idxL) return `\\sqrt[${idxL}]{${baseL}}`;
-        if (baseL) return `\\sqrt{${baseL}}`;
+        repl = idxL
+          ? `\\sqrt[${idxL}]{${baseL || ""}}`
+          : `\\sqrt{${baseL || ""}}`;
       }
-    }
-  }
 
-  return "";
-}
-
-function mathmlToLatexSafe(mml) {
-  try {
-    if (!mml || !String(mml).includes("<math")) return "";
-
-    // ✅ normalize prefixes + menclose radical
-    const norm = normalizeMathML(mml);
-
-    const latex0 = (MathMLToLaTeX.convert(norm) || "").trim();
-    let out = postProcessLatex(latex0, norm);
-
-    // ✅ nếu MathML có radical nhưng latex bị rơi \sqrt/\root => HARD rebuild
-    if (SQRT_MATHML_RE.test(norm) && !/\\sqrt\b|\\root\b/.test(out)) {
-      const hard = hardSqrtFromMathML(norm);
-      if (hard) out = hard;
+      // replace raw token and also token inside \text{...}
+      const re = new RegExp(`(\\\\text\\{\\s*)?${token}(\\s*\\})?`, "g");
+      latex = latex.replace(re, repl);
     }
 
-    return String(out || "").replace(/\s+/g, " ").trim();
+    return String(latex || "").replace(/\s+/g, " ").trim();
   } catch {
     return "";
   }
@@ -549,7 +534,7 @@ async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
         return;
       }
 
-      // fallback preview image
+      // fallback preview image (chỉ khi THẬT SỰ không convert được)
       if (info.previewRid) {
         const t = rels.get(info.previewRid);
         if (t) {
@@ -685,10 +670,7 @@ function wordXmlToTextKeepTokens(docXml) {
 }
 
 /* ================= SECTION TITLES (PHẦN ...) ================= */
-/**
- * Trả về sections theo VỊ TRÍ ký tự (startChar/endChar) + index câu toàn cục.
- * Không lệch khi mỗi PHẦN reset "Câu 1."
- */
+
 function extractSectionTitles(rawText) {
   const text = String(rawText || "").replace(/\r/g, "");
 
@@ -1098,28 +1080,16 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     // sections theo vị trí + index câu toàn cục
     const sections = extractSectionTitles(text);
 
-    // thêm vào exam
     exam.sections = sections;
-
-    // gán sectionOrder/sectionTitle cho từng question
     attachSectionOrderToQuestions(exam, sections);
-
-    // ✅ blocks đã trộn đúng thứ tự để frontend render chuẩn như Word
     const blocks = buildOrderedBlocks(exam);
-
-    // legacy
     const questions = legacyQuestionsFromExam(exam);
 
     res.json({
       ok: true,
       total: exam.questions.length,
-
-      // Nếu vẫn cần, vẫn trả sections (để debug)
       sections,
-
-      // ✅ QUAN TRỌNG: frontend hãy dùng blocks
       blocks,
-
       exam,
       questions,
       latex: latexMap,
