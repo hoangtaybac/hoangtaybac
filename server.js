@@ -165,6 +165,87 @@ function rubyOleToMathML(oleBuf) {
 
 const SQRT_MATHML_RE = /(msqrt|mroot|√|&#8730;|&#x221a;|&#x221A;|&radic;)/i;
 
+/** ✅ Add MathML namespace if missing */
+function ensureMathMLNamespace(mathml) {
+  if (!mathml) return mathml;
+  let s = String(mathml);
+  s = s.replace(/<\?xml[^>]*\?>/gi, "").trim();
+  s = s.replace(
+    /<math(?![^>]*\bxmlns=)/i,
+    '<math xmlns="http://www.w3.org/1998/Math/MathML"'
+  );
+  return s;
+}
+
+/** (optional) Normalize <mtable ...> -> <mtable> */
+function normalizeMtable(mathml) {
+  if (!mathml) return mathml;
+  return String(mathml).replace(/<mtable\b[^>]*>/gi, "<mtable>");
+}
+
+/**
+ * ✅ FIX: Pre-process MathML to ensure sqrt elements are properly formatted
+ * Many MathType outputs represent sqrt as <mo>√</mo> + following node
+ */
+function preprocessMathMLForSqrt(mathml) {
+  if (!mathml) return mathml;
+  let s = String(mathml);
+
+  const moSqrt = String.raw`<mo>\s*(?:√|&#8730;|&#x221a;|&#x221A;|&radic;)\s*<\/mo>`;
+
+  s = s.replace(
+    new RegExp(moSqrt + String.raw`\s*<mrow>([\s\S]*?)<\/mrow>`, "gi"),
+    "<msqrt>$1</msqrt>"
+  );
+  s = s.replace(
+    new RegExp(moSqrt + String.raw`\s*<mi>([^<]+)<\/mi>`, "gi"),
+    "<msqrt><mi>$1</mi></msqrt>"
+  );
+  s = s.replace(
+    new RegExp(moSqrt + String.raw`\s*<mn>([^<]+)<\/mn>`, "gi"),
+    "<msqrt><mn>$1</mn></msqrt>"
+  );
+  s = s.replace(
+    new RegExp(moSqrt + String.raw`\s*<mfenced([^>]*)>([\s\S]*?)<\/mfenced>`, "gi"),
+    "<msqrt><mfenced$1>$2</mfenced></msqrt>"
+  );
+
+  return s;
+}
+
+/**
+ * ✅ FIX: Post-process LaTeX to fix remaining sqrt issues
+ */
+function postprocessLatexSqrt(latex) {
+  if (!latex) return latex;
+  let s = String(latex);
+
+  // Some converters output \surd instead of \sqrt
+  s = s.replace(/\\surd\b/g, "\\sqrt{}");
+
+  // Fix: Sometimes √ symbol remains unconverted
+  s = s.replace(/√\s*\{([^}]+)\}/g, "\\sqrt{$1}");
+  s = s.replace(/√\s*\(([^)]+)\)/g, "\\sqrt{$1}");
+  s = s.replace(/√\s*(\d+)/g, "\\sqrt{$1}");
+  s = s.replace(/√\s*([a-zA-Z])/g, "\\sqrt{$1}");
+
+  // Fix: \sqrt without braces - add braces for single character/number
+  s = s.replace(/\\sqrt\s+(\d+)(?![}\d])/g, "\\sqrt{$1}");
+  s = s.replace(/\\sqrt\s+([a-zA-Z])(?![}\w])/g, "\\sqrt{$1}");
+
+  // Fix: Empty sqrt
+  s = s.replace(/\\sqrt\s*\{\s*\}/g, "\\sqrt{\\phantom{x}}");
+
+  // Fix: Malformed sqrt with extra spaces
+  s = s.replace(/\\sqrt\s+\{/g, "\\sqrt{");
+
+  // Fix: nth root - \root{n}\of{x} -> \sqrt[n]{x}
+  s = s.replace(/\\root\s*\{([^}]+)\}\s*\\of\s*\{([^}]+)\}/g, "\\sqrt[$1]{$2}");
+  s = s.replace(/\\sqrt\s*\[\s*(\d+)\s*\]\s*\{/g, "\\sqrt[$1]{");
+
+  return s;
+}
+
 function sanitizeLatexStrict(latex) {
   if (!latex) return latex;
   latex = String(latex).replace(/\s+/g, " ").trim();
@@ -298,7 +379,7 @@ function fixPiecewiseFunction(latex) {
 }
 
 /**
- * ✅ FIX MẤT CĂN THỨC:
+ * ✅ FIX MẤT CĂN THỨC (HARD):
  * Nếu MathML có msqrt/mroot nhưng converter trả về latex bị rơi \sqrt => bọc lại \sqrt{...}
  */
 function fixSqrtLatex(latex, mathmlMaybe = "") {
@@ -324,19 +405,33 @@ function fixSqrtLatex(latex, mathmlMaybe = "") {
 
 function postProcessLatex(latex, mathmlMaybe = "") {
   let s = latex || "";
+
+  // ✅ apply sanitize + other repairs
   s = sanitizeLatexStrict(s);
   s = fixSetBracesHard(s);
   s = restoreArrowAndCoreCommands(s);
   s = fixPiecewiseFunction(s);
+
+  // ✅ apply sqrt repairs (soft) before hard-wrap
+  s = postprocessLatexSqrt(s);
+
+  // ✅ hard wrap if MathML had sqrt but LaTeX lost it
   s = fixSqrtLatex(s, mathmlMaybe);
+
   return String(s || "").replace(/\s+/g, " ").trim();
 }
 
 function mathmlToLatexSafe(mml) {
   try {
     if (!mml || !mml.includes("<math")) return "";
-    const latex0 = (MathMLToLaTeX.convert(mml) || "").trim();
-    return postProcessLatex(latex0, mml);
+
+    // ✅ Stabilize MathML before converting
+    let mm = ensureMathMLNamespace(mml);
+    mm = normalizeMtable(mm);
+    mm = preprocessMathMLForSqrt(mm);
+
+    const latex0 = (MathMLToLaTeX.convert(mm) || "").trim();
+    return postProcessLatex(latex0, mm);
   } catch {
     return "";
   }
