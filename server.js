@@ -751,9 +751,371 @@ function splitByMath(html) {
   if (last < html.length) out.push({ math: false, text: html.slice(last) });
   return out;
 }
-// ... IMPORTANT: paste ALL remaining helper functions from your current file:
-// normalizeGluedChoiceMarkers, formatExamLayout, parseExamFromInlineHtml, removeUnsupportedImages, ...
-// (Giữ nguyên như bạn đang có)
+
+function normalizeGluedChoiceMarkers(s) {
+  s = String(s || "");
+  s = s.replace(/([^<\s>])([ABCD])\./g, "$1 $2.");
+  s = s.replace(/([^<\s>])([a-d])\)/gi, "$1 $2)");
+  s = s.replace(/([^<\s>])(<u[^>]*>\s*[ABCD]\s*<\/u>\s*\.)/gi, "$1 $2");
+  s = s.replace(/([^<\s>])(<u[^>]*>\s*[a-d]\s*<\/u>\s*\))/gi, "$1 $2");
+  return s;
+}
+
+function formatExamLayout(html) {
+  let result = html;
+
+  result = result.replace(/\s+/g, " ");
+  result = result.replace(/PHẦN(\d)/gi, "PHẦN $1");
+
+  result = result.replace(
+    /(^|<br\/>)\s*(PHẦN\s+\d+\.(?:(?!<br\/>\s*Câu\s+\d).)*)/g,
+    '$1<br/><div class="section-header"><strong>$2</strong></div>'
+  );
+
+  const parts = splitByMath(result);
+
+  for (const p of parts) {
+    if (p.math) continue;
+
+    p.text = normalizeGluedChoiceMarkers(p.text);
+
+    p.text = p.text
+      .replace(/(^|<br\/>\s*<br\/>|\n)\s*([ABCD])\./g, "$1&emsp;$2.")
+      .replace(/([^<\n])\s*([ABCD])\./g, "$1<br/>&emsp;$2.");
+
+    p.text = p.text
+      .replace(/(^|<br\/>\s*<br\/>|\n)\s*(<u[^>]*>\s*[ABCD]\s*<\/u>\s*\.)/gi, "$1&emsp;$2")
+      .replace(/([^<\n])\s*(<u[^>]*>\s*[ABCD]\s*<\/u>\s*\.)/gi, "$1<br/>&emsp;$2");
+
+    p.text = formatAbcdOutsideHeaders(p.text);
+
+    p.text = p.text.replace(/(Câu)\s*(\d+)\s*\./g, "$1 $2.");
+    p.text = p.text.replace(/(<br\/>\s*){3,}/g, "<br/><br/>");
+  }
+
+  return parts.map((x) => x.text).join("");
+}
+
+function formatAbcdOutsideHeaders(text) {
+  const headerRegex = /(<div class="section-header">[\s\S]*?<\/div>)/g;
+  const segments = text.split(headerRegex);
+
+  return segments
+    .map((seg) => {
+      if (seg.startsWith('<div class="section-header">')) {
+        return seg;
+      }
+
+      let s = seg;
+
+      s = s
+        .replace(/(^|<br\/>\s*<br\/>|\n)\s*([a-d])\)/gi, "$1&emsp;$2)")
+        .replace(/([^<\n])\s*([a-d])\)/gi, "$1<br/>&emsp;$2)");
+
+      s = s
+        .replace(/(^|<br\/>\s*<br\/>|\n)\s*(<u[^>]*>\s*[a-d]\s*\)\s*<\/u>)/gi, "$1&emsp;$2")
+        .replace(/([^<\n])\s*(<u[^>]*>\s*[a-d]\s*\)\s*<\/u>)/gi, "$1<br/>&emsp;$2");
+
+      s = s
+        .replace(/(^|<br\/>\s*<br\/>|\n)\s*(<u[^>]*>\s*[a-d]\s*<\/u>\s*\))/gi, "$1&emsp;$2")
+        .replace(/([^<\n])\s*(<u[^>]*>\s*[a-d]\s*<\/u>\s*\))/gi, "$1<br/>&emsp;$2");
+
+      return s;
+    })
+    .join("");
+}
+
+/* ================== EXAM PARSING + SOLUTION SPLIT ================== */
+function stripAllTagsToPlain(html) {
+  return String(html || "")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/&emsp;/g, " ")
+    .replace(/<[^>]*>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+function detectHasMCQ(plain) {
+  const marks = plain.match(/\b[ABCD]\./g) || [];
+  return new Set(marks).size >= 2;
+}
+function detectHasTF4(plain) {
+  const marks = plain.match(/\b[a-d]\)/gi) || [];
+  return new Set(marks.map((x) => x.toLowerCase())).size >= 2;
+}
+
+function findSolutionMarkerIndex(html, fromIndex = 0) {
+  const s = String(html || "");
+  const re =
+    /(Lời(?:\s*<[^>]*>)*\s*giải|Giải(?:\s*<[^>]*>)*\s*chi\s*tiết|Hướng(?:\s*<[^>]*>)*\s*dẫn(?:\s*<[^>]*>)*\s*giải)/i;
+  const sub = s.slice(fromIndex);
+  const m = re.exec(sub);
+  if (!m) return -1;
+  return fromIndex + m.index;
+}
+
+function splitSolutionSections(tailHtml) {
+  let s = String(tailHtml || "").trim();
+  if (!s) return { solutionHtml: "", detailHtml: "" };
+
+  const reCT = /(Giải(?:\s*<[^>]*>)*\s*chi\s*tiết)/i;
+  const matchCT = reCT.exec(s);
+
+  if (matchCT) {
+    const idxCT = matchCT.index;
+    return {
+      solutionHtml: s.slice(0, idxCT).trim(),
+      detailHtml: s.slice(idxCT).trim(),
+    };
+  }
+
+  return { solutionHtml: s, detailHtml: "" };
+}
+
+function extractUnderlinedKeys(blockHtml) {
+  const keys = { mcq: null, tf: [] };
+  const s = String(blockHtml || "");
+
+  let m =
+    s.match(/<u[^>]*>\s*([A-D])\s*<\/u>\s*\./i) ||
+    s.match(/<u[^>]*>\s*([A-D])\.\s*<\/u>/i);
+  if (m) keys.mcq = m[1].toUpperCase();
+
+  let mm;
+  const reTF1 = /<u[^>]*>\s*([a-d])\s*\)\s*<\/u>/gi;
+  while ((mm = reTF1.exec(s)) !== null) keys.tf.push(mm[1].toLowerCase());
+
+  const reTF2 = /<u[^>]*>\s*([a-d])\s*<\/u>\s*\)/gi;
+  while ((mm = reTF2.exec(s)) !== null) keys.tf.push(mm[1].toLowerCase());
+
+  keys.tf = [...new Set(keys.tf)];
+  return keys;
+}
+
+function normalizeUnderlinedMarkersForSplit(html) {
+  let s = String(html || "");
+  s = s.replace(/<u[^>]*>\s*([A-D])\s*<\/u>\s*\./gi, "$1.");
+  s = s.replace(/<u[^>]*>\s*([A-D])\.\s*<\/u>/gi, "$1.");
+  s = s.replace(/<u[^>]*>\s*([a-d])\s*\)\s*<\/u>/gi, "$1)");
+  s = s.replace(/<u[^>]*>\s*([a-d])\s*<\/u>\s*\)/gi, "$1)");
+  return s;
+}
+
+function removeUnsupportedImages(html) {
+  let s = String(html || "");
+
+  s = s.replace(/<img[^>]*src\s*=\s*["']\s*["'][^>]*>/gi, "");
+  s = s.replace(/<img(?![^>]*src\s*=)[^>]*>/gi, "");
+  s = s.replace(/<img[^>]*data:application\/octet-stream[^>]*>/gi, "");
+
+  return s;
+}
+
+function splitChoicesHtmlABCD(blockHtml) {
+  let s = normalizeUnderlinedMarkersForSplit(blockHtml);
+  s = s.replace(/&emsp;/g, " ");
+  s = normalizeGluedChoiceMarkers(s);
+  s = s.replace(/<br\/>/g, " <br/>");
+
+  const re = /(^|[\s>.:;,<\)\]\}！？\?])([ABCD])\./g;
+
+  const hits = [];
+  let m;
+  while ((m = re.exec(s)) !== null) hits.push({ idx: m.index + m[1].length, key: m[2] });
+  if (hits.length < 2) return null;
+
+  const lastStart = hits[hits.length - 1].idx;
+  const solIdx = findSolutionMarkerIndex(s, lastStart);
+  const endAll = solIdx >= 0 ? solIdx : s.length;
+
+  const out = {
+    _stem: s.slice(0, hits[0].idx).trim(),
+    _tail: solIdx >= 0 ? s.slice(solIdx).trim() : "",
+  };
+
+  for (let i = 0; i < hits.length; i++) {
+    const key = hits[i].key;
+    const start = hits[i].idx;
+    const end = i + 1 < hits.length ? hits[i + 1].idx : endAll;
+    let seg = s.slice(start, end).trim();
+    seg = seg.replace(/^([ABCD])\.\s*/i, "");
+    out[key] = removeUnsupportedImages(seg.trim());
+  }
+  return out;
+}
+
+function splitStatementsHtmlabcd(blockHtml) {
+  let s = normalizeUnderlinedMarkersForSplit(blockHtml);
+  s = s.replace(/&emsp;/g, " ");
+  s = normalizeGluedChoiceMarkers(s);
+  s = s.replace(/<br\/>/g, " <br/>");
+
+  const earlysolIdx = findSolutionMarkerIndex(s, 0);
+  let workingHtml = s;
+  let tailHtml = "";
+
+  if (earlysolIdx >= 0) {
+    workingHtml = s.slice(0, earlysolIdx);
+    tailHtml = s.slice(earlysolIdx).trim();
+  }
+
+  const re = /(^|[\s>.:;,<\)\]\}！？\?])([a-d])\)/gi;
+
+  const hits = [];
+  let m;
+  while ((m = re.exec(workingHtml)) !== null) {
+    hits.push({ idx: m.index + m[1].length, key: m[2].toLowerCase() });
+  }
+  if (hits.length < 2) return null;
+
+  const out = {
+    _stem: workingHtml.slice(0, hits[0].idx).trim(),
+    _tail: tailHtml,
+  };
+
+  for (let i = 0; i < hits.length; i++) {
+    const key = hits[i].key;
+    const start = hits[i].idx;
+    const end = i + 1 < hits.length ? hits[i + 1].idx : workingHtml.length;
+    let seg = workingHtml.slice(start, end).trim();
+    seg = seg.replace(/^([a-d])\)\s*/i, "");
+    out[key] = removeUnsupportedImages(seg.trim());
+  }
+  return out;
+}
+
+function cleanStem(html) {
+  if (!html) return html;
+  return String(html).replace(/^Câu\s+\d+\.?\s*/i, "").trim();
+}
+
+function parseExamFromInlineHtml(inlineHtml) {
+  const re = /(^|<br\/>\s*)\s*(?:<[^>]*>\s*)*Câu\s+(\d+)\./gi;
+
+  const hits = [];
+  let m;
+  while ((m = re.exec(inlineHtml)) !== null) {
+    const startAt = m.index + m[1].length;
+    hits.push({ qno: Number(m[2]), pos: startAt });
+  }
+  if (!hits.length) return null;
+
+  const sectionRe = /<div class="section-header"><strong>([\s\S]*?)<\/strong><\/div>/gi;
+  const sections = [];
+  let sectionMatch;
+  while ((sectionMatch = sectionRe.exec(inlineHtml)) !== null) {
+    sections.push({
+      pos: sectionMatch.index,
+      html: sectionMatch[0],
+      title: sectionMatch[1].trim(),
+    });
+  }
+
+  const rawBlocks = [];
+  for (let i = 0; i < hits.length; i++) {
+    const start = hits[i].pos;
+    let end = i + 1 < hits.length ? hits[i + 1].pos : inlineHtml.length;
+
+    for (const sec of sections) {
+      if (sec.pos > start && sec.pos < end) {
+        end = sec.pos;
+        break;
+      }
+    }
+
+    rawBlocks.push({ qno: hits[i].qno, pos: hits[i].pos, html: inlineHtml.slice(start, end) });
+  }
+
+  const blocks = [];
+  for (const b of rawBlocks) {
+    const last = blocks[blocks.length - 1];
+    if (last && last.qno === b.qno) {
+      last.html += "<br/>" + b.html;
+    } else {
+      blocks.push({ ...b });
+    }
+  }
+
+  const exam = { version: 8, questions: [], sections };
+
+  function findSectionForQuestion(qPos) {
+    let currentSection = null;
+    for (const sec of sections) {
+      if (sec.pos < qPos) currentSection = sec;
+      else break;
+    }
+    return currentSection;
+  }
+
+  for (const b of blocks) {
+    const under = extractUnderlinedKeys(b.html);
+    const plain = stripAllTagsToPlain(b.html);
+
+    const section = findSectionForQuestion(b.pos);
+
+    const isMCQ = detectHasMCQ(plain);
+    const isTF4 = !isMCQ && detectHasTF4(plain);
+
+    if (isMCQ) {
+      const parts = splitChoicesHtmlABCD(b.html);
+      const sol = splitSolutionSections(parts?._tail || "");
+      exam.questions.push({
+        no: b.qno,
+        type: "mcq",
+        stemHtml: cleanStem(parts?._stem || b.html),
+        choicesHtml: { A: parts?.A || "", B: parts?.B || "", C: parts?.C || "", D: parts?.D || "" },
+        answer: under.mcq,
+        solutionHtml: sol.solutionHtml,
+        detailHtml: sol.detailHtml,
+        _plain: plain,
+        section: section ? { title: section.title, html: section.html } : null,
+      });
+      continue;
+    }
+
+    if (isTF4) {
+      const parts = splitStatementsHtmlabcd(b.html);
+      const sol = splitSolutionSections(parts?._tail || "");
+
+      const ans = { a: null, b: null, c: null, d: null };
+      for (const k of ["a", "b", "c", "d"]) {
+        if (under.tf.includes(k)) ans[k] = true;
+      }
+
+      exam.questions.push({
+        no: b.qno,
+        type: "tf4",
+        stemHtml: cleanStem(parts?._stem || b.html),
+        statements: { a: parts?.a || "", b: parts?.b || "", c: parts?.c || "", d: parts?.d || "" },
+        answer: ans,
+        solutionHtml: sol.solutionHtml,
+        detailHtml: sol.detailHtml,
+        _plain: plain,
+        section: section ? { title: section.title, html: section.html } : null,
+      });
+      continue;
+    }
+
+    const solIdx = findSolutionMarkerIndex(b.html, 0);
+    const stemPart = solIdx >= 0 ? b.html.slice(0, solIdx).trim() : b.html;
+    const tailPart = solIdx >= 0 ? b.html.slice(solIdx).trim() : "";
+
+    const sol = splitSolutionSections(tailPart);
+
+    exam.questions.push({
+      no: b.qno,
+      type: "short",
+      stemHtml: cleanStem(stemPart),
+      boxes: 4,
+      solutionHtml: sol.solutionHtml || tailPart,
+      detailHtml: sol.detailHtml || "",
+      _plain: plain,
+      section: section ? { title: section.title, html: section.html } : null,
+    });
+  }
+
+  return exam;
+}
+
 
 /* ================== ROUTES ================== */
 app.get("/", (req, res) => res.type("text").send("MathType Converter API: POST /convert-docx-html, GET /health"));
