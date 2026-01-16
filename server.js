@@ -1,5 +1,8 @@
 // server.js
-// ✅ FULL CODE (FIX: tiêu đề PHẦN trả về đúng vị trí so với câu theo bản gốc, kể cả khi Câu bị reset lại từ 1 ở mỗi PHẦN)
+// ✅ FULL CODE (FIX: tiêu đề PHẦN đúng vị trí như file Word gốc)
+// - Không lệch khi mỗi PHẦN reset "Câu 1."
+// - Server trả thêm `blocks` đã trộn (section + question) đúng thứ tự để frontend render chuẩn.
+//
 // Chạy: node server.js
 // Yêu cầu: inkscape (convert emf/wmf), ruby + mt2mml.rb (fallback MathType)
 // npm i express multer unzipper cors mathml-to-latex
@@ -333,7 +336,7 @@ function mathmlToLatexSafe(mml) {
 
 async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
   let idx = 0;
-  const found = {}; // key -> { oleTarget, previewRid }
+  const found = {};
   const OBJECT_RE = /<w:object[\s\S]*?<\/w:object>/g;
 
   docXml = docXml.replace(OBJECT_RE, (block) => {
@@ -344,12 +347,8 @@ async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
     const oleTarget = rels.get(oleRid);
     if (!oleTarget) return block;
 
-    const vmlRid = block.match(
-      /<v:imagedata\b[^>]*\br:id="([^"]+)"[^>]*\/>/
-    );
-    const blipRid = block.match(
-      /<a:blip\b[^>]*\br:embed="([^"]+)"[^>]*\/>/
-    );
+    const vmlRid = block.match(/<v:imagedata\b[^>]*\br:id="([^"]+)"[^>]*\/>/);
+    const blipRid = block.match(/<a:blip\b[^>]*\br:embed="([^"]+)"[^>]*\/>/);
     const previewRid = vmlRid?.[1] || blipRid?.[1] || null;
 
     const key = `mathtype_${++idx}`;
@@ -516,11 +515,10 @@ function wordXmlToTextKeepTokens(docXml) {
   return x;
 }
 
-/* ================= SECTION TITLES (PHẦN ...) ✅ FIX CHUẨN THEO VỊ TRÍ ================= */
+/* ================= SECTION TITLES (PHẦN ...) ================= */
 /**
- * Vấn đề file gốc hay gặp: mỗi PHẦN lại bắt đầu "Câu 1." -> nếu map bằng số câu sẽ lệch.
- * => Trả về sections theo VỊ TRÍ KÝ TỰ (startChar/endChar) và theo INDEX câu toàn cục (questionIndexStart/End).
- * Frontend dùng slice theo index để luôn đúng thứ tự như file.
+ * Trả về sections theo VỊ TRÍ ký tự (startChar/endChar) + index câu toàn cục.
+ * Không lệch khi mỗi PHẦN reset "Câu 1."
  */
 function extractSectionTitles(rawText) {
   const text = String(rawText || "").replace(/\r/g, "");
@@ -546,7 +544,6 @@ function extractSectionTitles(rawText) {
     const startChar = sm.index + (sm[1] ? sm[1].length : 0);
 
     let titleLine = `PHẦN ${sm[2]}. ${sm[3] || ""}`.trim();
-    // cắt nếu dính "Câu ..."
     const cutIdx = titleLine.search(/(?=\bCâu\s+\d+\.)/i);
     if (cutIdx > 0) titleLine = titleLine.slice(0, cutIdx).trim();
 
@@ -562,13 +559,11 @@ function extractSectionTitles(rawText) {
     });
   }
 
-  // set endChar
   for (let i = 0; i < sections.length; i++) {
     sections[i].endChar =
       i + 1 < sections.length ? sections[i + 1].startChar : text.length;
   }
 
-  // map questions by character range
   for (const sec of sections) {
     const startIdx = qAnchors.findIndex(
       (q) => q.idx >= sec.startChar && q.idx < sec.endChar
@@ -848,12 +843,11 @@ function legacyQuestionsFromExam(exam) {
   return out;
 }
 
-/* ================= helper: gán sectionOrder cho từng question theo index slice ================= */
+/* ================= helper: gán sectionOrder cho từng question ================= */
 
 function attachSectionOrderToQuestions(exam, sections) {
   if (!exam?.questions?.length || !Array.isArray(sections)) return;
 
-  // reset
   for (const q of exam.questions) {
     q.sectionOrder = null;
     q.sectionTitle = null;
@@ -873,6 +867,30 @@ function attachSectionOrderToQuestions(exam, sections) {
       exam.questions[i].sectionTitle = sec.title;
     }
   }
+}
+
+/* ================= ✅ FIX UI: BUILD BLOCKS (SECTION + QUESTION) đúng thứ tự ================= */
+/**
+ * Nếu frontend render `sections` riêng ở đầu trang => sẽ bị như ảnh của bạn.
+ * => Tạo `blocks` đã TRỘN sẵn để frontend chỉ render theo blocks.
+ */
+function buildOrderedBlocks(exam) {
+  const blocks = [];
+  let lastSec = null;
+
+  for (const q of exam?.questions || []) {
+    const sec = q.sectionOrder || null;
+    if (sec && sec !== lastSec) {
+      blocks.push({
+        type: "section",
+        order: sec,
+        title: q.sectionTitle || `PHẦN ${sec}`,
+      });
+      lastSec = sec;
+    }
+    blocks.push({ type: "question", data: q });
+  }
+  return blocks;
 }
 
 /* ================= API ================= */
@@ -911,14 +929,17 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     // 4) parse exam output (GIỮ NGUYÊN)
     const exam = parseExamFromText(text);
 
-    // ✅ sections theo vị trí + index câu toàn cục (không lệch khi Câu reset)
+    // sections theo vị trí + index câu toàn cục
     const sections = extractSectionTitles(text);
 
     // thêm vào exam
     exam.sections = sections;
 
-    // ✅ gán sectionOrder/sectionTitle cho từng question (không sửa thuật toán parse)
+    // gán sectionOrder/sectionTitle cho từng question
     attachSectionOrderToQuestions(exam, sections);
+
+    // ✅ blocks đã trộn đúng thứ tự để frontend render chuẩn như Word
+    const blocks = buildOrderedBlocks(exam);
 
     // legacy
     const questions = legacyQuestionsFromExam(exam);
@@ -926,7 +947,13 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     res.json({
       ok: true,
       total: exam.questions.length,
+
+      // Nếu vẫn cần, vẫn trả sections (để debug)
       sections,
+
+      // ✅ QUAN TRỌNG: frontend hãy dùng blocks
+      blocks,
+
       exam,
       questions,
       latex: latexMap,
