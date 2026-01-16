@@ -3,7 +3,7 @@
 // - FIX: OLE scan bắt được cả <math> và <m:math>
 // - FIX: normalize MathML (strip m: prefix + menclose radical -> msqrt + mo √ -> msqrt)
 // - FIX: tách riêng biểu thức có căn => chạy pipeline radical-safe
-// - FIX: tokenize ALL msqrt/mroot -> token (dùng <mi> + token không underscore), convert, rồi rebuild \sqrt/\sqrt[n]{}
+// - FIX: tokenize ALL msqrt/mroot (INNermost-first) -> token (dùng <mi> + token không underscore), convert, rồi rebuild \sqrt/\sqrt[n]{}
 // - FIX: restore token robust (token bị tách ký tự + wrapper \text/\mathrm/\operatorname/...)
 // - Giữ nguyên thuật toán parse PHẦN/Câu/underline/blocks của bạn
 //
@@ -135,7 +135,7 @@ function extractMathMLFromOleScan(buf) {
     const open = s.search(/<\s*(?:[A-Za-z0-9_]+:)?math\b/i);
     if (open === -1) return null;
 
-    const closeRe = /<\/\s*(?:[A-Za-z0-9_]+:)?math\s*>/ig;
+    const closeRe = /<\/\s*(?:[A-Za-z0-9_]+:)?math\s*>/gi;
     closeRe.lastIndex = open;
     const m = closeRe.exec(s);
     if (!m) return null;
@@ -379,42 +379,37 @@ function normalizeMathML(mml = "") {
   return s;
 }
 
-function extractTagBlock(s, tag, fromIdx) {
-  const openRe = new RegExp(`<\\s*${tag}\\b[^>]*>`, "ig");
-  openRe.lastIndex = fromIdx;
-  const m = openRe.exec(s);
-  if (!m) return null;
+// ===== NEW: find innermost <tag>...</tag> robust (works with nesting) =====
+function findInnermostTagBlock(s, tag) {
+  const x = String(s || "");
+  const t = String(tag || "").toLowerCase();
+  if (!x) return null;
 
-  const start = m.index;
-  const openLen = m[0].length;
-  const innerStart = start + openLen;
+  const re = new RegExp(`<\\s*(\\/?)\\s*${t}\\b[^>]*>`, "ig");
+  const stack = [];
 
-  const anyTagRe = /<\s*\/?\s*[A-Za-z0-9_]+\b[^>]*>/g;
-  anyTagRe.lastIndex = innerStart;
+  let m;
+  while ((m = re.exec(x)) !== null) {
+    const isClose = !!m[1];
+    const start = m.index;
+    const end = m.index + m[0].length;
 
-  let depth = 1;
-  let mm;
+    if (!isClose) {
+      // opening tag
+      stack.push({ start, innerStart: end });
+    } else {
+      // closing tag -> pair with nearest open (innermost)
+      const open = stack.pop();
+      if (!open) continue;
 
-  while ((mm = anyTagRe.exec(s)) !== null) {
-    const t = mm[0];
-    const isClose = /^<\s*\//.test(t);
-    const name = (
-      t.match(/^<\s*\/?\s*([A-Za-z0-9_]+)/)?.[1] || ""
-    ).toLowerCase();
+      const blockStart = open.start;
+      const blockEnd = end;
+      const inner = x.slice(open.innerStart, start);
 
-    if (name !== tag.toLowerCase()) continue;
-
-    if (!isClose) depth++;
-    else depth--;
-
-    if (depth === 0) {
-      const end = mm.index + t.length;
-      const inner = s.slice(innerStart, mm.index);
-      return { start, end, inner };
+      return { start: blockStart, end: blockEnd, inner };
     }
   }
-
-  return { start, end: s.length, inner: s.slice(innerStart) };
+  return null;
 }
 
 function splitTopLevelChildren(inner) {
@@ -449,23 +444,24 @@ function splitTopLevelChildren(inner) {
   return parts;
 }
 
+// ===== NEW: tokenize radicals innermost-first so nested radicals are preserved =====
 function tokenizeRadicals(normMathML) {
   let s = String(normMathML || "");
   const map = {};
   let i = 0;
 
-  // tokenize all msqrt
+  // tokenize all msqrt (innermost-first)
   for (;;) {
-    const blk = extractTagBlock(s, "msqrt", 0);
+    const blk = findInnermostTagBlock(s, "msqrt");
     if (!blk) break;
     const token = `ZZSQRT${i++}ZZ`; // ✅ no underscore
     map[token] = { kind: "sqrt", inner: blk.inner };
     s = s.slice(0, blk.start) + `<mi>${token}</mi>` + s.slice(blk.end);
   }
 
-  // tokenize all mroot
+  // tokenize all mroot (innermost-first)
   for (;;) {
-    const blk = extractTagBlock(s, "mroot", 0);
+    const blk = findInnermostTagBlock(s, "mroot");
     if (!blk) break;
     const token = `ZZROOT${i++}ZZ`;
     const kids = splitTopLevelChildren(blk.inner);
@@ -496,7 +492,11 @@ function mathmlToLatexSafe(mml) {
     let latex = (MathMLToLaTeX.convert(tokMml) || "").trim();
     latex = postProcessLatex(latex, tokMml);
 
-    for (const [token, info] of Object.entries(map)) {
+    // ✅ IMPORTANT: rebuild OUTER -> INNER (reverse insertion order)
+    const entries = Object.entries(map);
+    for (let k = entries.length - 1; k >= 0; k--) {
+      const [token, info] = entries[k];
+
       let repl = "";
 
       if (info.kind === "sqrt") {
@@ -523,6 +523,12 @@ function mathmlToLatexSafe(mml) {
       }
 
       latex = latex.replace(tokenRegex(token), repl);
+    }
+
+    // last resort: nếu MathML có căn mà latex vẫn không có \sqrt
+    if (hasRadicalInMathML(norm) && !/\\sqrt\b/.test(latex || "")) {
+      const inner = String(latex || "").trim() || " ";
+      latex = `\\sqrt{${inner}}`;
     }
 
     return String(latex || "").replace(/\s+/g, " ").trim();
