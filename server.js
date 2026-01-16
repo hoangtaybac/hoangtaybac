@@ -1,7 +1,10 @@
 // server.js
 // ✅ FULL CODE (FIX: tiêu đề PHẦN đúng vị trí như file Word gốc)
-// - Không lệch khi mỗi PHẦN reset "Câu 1."
-// - Server trả thêm `blocks` đã trộn (section + question) đúng thứ tự để frontend render chuẩn.
+// ✅ FIX MẤT CĂN THỨC MathType:
+//   (1) Decode MathML bị escape (&lt;math ...&gt;) trước khi convert LaTeX
+//   (2) Cắt MathML từ <math>...</math> nếu stdout có rác
+//   (3) Giới hạn concurrency khi gọi ruby (ổn định hơn, không timeout rớt công thức)
+//   (4) Nếu LaTeX rỗng nhưng có preview image => tự đổi token math thành img token ngay tại chỗ (frontend không cần sửa)
 //
 // Chạy: node server.js
 // Yêu cầu: inkscape (convert emf/wmf), ruby + mt2mml.rb (fallback MathType)
@@ -60,7 +63,7 @@ function guessMimeFromFilename(filename = "") {
 }
 
 function decodeXmlEntities(s = "") {
-  return s
+  return String(s || "")
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
     .replace(/&amp;/g, "&")
@@ -76,6 +79,21 @@ async function getZipEntryBuffer(zipFiles, p) {
   const f = zipFiles.find((x) => x.path === p);
   if (!f) return null;
   return await f.buffer();
+}
+
+/* ======= Small concurrency limiter (ổn định ruby, không rớt công thức) ======= */
+async function mapLimit(items, limit, worker) {
+  const ret = new Array(items.length);
+  let i = 0;
+  const runners = Array.from({ length: Math.max(1, limit) }, async () => {
+    while (true) {
+      const cur = i++;
+      if (cur >= items.length) break;
+      ret[cur] = await worker(items[cur], cur);
+    }
+  });
+  await Promise.all(runners);
+  return ret;
 }
 
 /* ================= Inkscape Convert EMF/WMF -> PNG ================= */
@@ -358,60 +376,84 @@ async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
 
   const latexMap = {};
 
-  await Promise.all(
-    Object.entries(found).map(async ([key, info]) => {
-      const oleFull = normalizeTargetToWordPath(info.oleTarget);
-      const oleBuf = await getZipEntryBuffer(zipFiles, oleFull);
+  const entries = Object.entries(found);
 
-      let mml = "";
-      if (oleBuf) mml = extractMathMLFromOleScan(oleBuf) || "";
+  // ✅ FIX: giới hạn số process ruby chạy song song (tránh timeout/rớt công thức)
+  await mapLimit(entries, 4, async ([key, info]) => {
+    const oleFull = normalizeTargetToWordPath(info.oleTarget);
+    const oleBuf = await getZipEntryBuffer(zipFiles, oleFull);
 
-      if (!mml && oleBuf) {
-        try {
-          mml = await rubyOleToMathML(oleBuf);
-        } catch {
-          mml = "";
-        }
+    let mml = "";
+    if (oleBuf) mml = extractMathMLFromOleScan(oleBuf) || "";
+
+    if (!mml && oleBuf) {
+      try {
+        mml = await rubyOleToMathML(oleBuf);
+      } catch {
+        mml = "";
       }
+    }
 
-      const latex = mml ? mathmlToLatexSafe(mml) : "";
-      if (latex) {
-        latexMap[key] = latex;
-        return;
-      }
+    // ✅ FIX: ruby có thể trả &lt;math...&gt; => decode
+    mml = (mml || "").trim();
+    if (mml && !mml.includes("<math") && mml.includes("&lt;math")) {
+      mml = decodeXmlEntities(mml);
+    }
 
-      // fallback preview image
-      if (info.previewRid) {
-        const t = rels.get(info.previewRid);
-        if (t) {
-          const imgFull = normalizeTargetToWordPath(t);
-          const imgBuf = await getZipEntryBuffer(zipFiles, imgFull);
-          if (imgBuf) {
-            const mime = guessMimeFromFilename(imgFull);
-            if (mime === "image/emf" || mime === "image/wmf") {
-              try {
-                const pngBuf = await maybeConvertEmfWmfToPng(imgBuf, imgFull);
-                if (pngBuf) {
-                  images[`fallback_${key}`] = `data:image/png;base64,${pngBuf.toString(
-                    "base64"
-                  )}`;
-                  latexMap[key] = "";
-                  return;
-                }
-              } catch {}
-            }
-            images[`fallback_${key}`] = `data:${mime};base64,${imgBuf.toString(
-              "base64"
-            )}`;
+    // ✅ FIX: cắt phần <math>...</math> nếu có rác trước/sau
+    if (mml && !mml.startsWith("<math")) {
+      const i = mml.indexOf("<math");
+      const j = mml.indexOf("</math>");
+      if (i !== -1 && j !== -1) mml = mml.slice(i, j + 7);
+    }
+
+    const latex = mml ? mathmlToLatexSafe(mml) : "";
+    if (latex) {
+      latexMap[key] = latex;
+      return;
+    }
+
+    // fallback preview image
+    if (info.previewRid) {
+      const t = rels.get(info.previewRid);
+      if (t) {
+        const imgFull = normalizeTargetToWordPath(t);
+        const imgBuf = await getZipEntryBuffer(zipFiles, imgFull);
+        if (imgBuf) {
+          const mime = guessMimeFromFilename(imgFull);
+          if (mime === "image/emf" || mime === "image/wmf") {
+            try {
+              const pngBuf = await maybeConvertEmfWmfToPng(imgBuf, imgFull);
+              if (pngBuf) {
+                images[`fallback_${key}`] = `data:image/png;base64,${pngBuf.toString(
+                  "base64"
+                )}`;
+                latexMap[key] = "";
+                return;
+              }
+            } catch {}
           }
+          images[`fallback_${key}`] = `data:${mime};base64,${imgBuf.toString(
+            "base64"
+          )}`;
         }
       }
+    }
 
-      latexMap[key] = "";
-    })
-  );
+    latexMap[key] = "";
+  });
 
-  return { outXml: docXml, latexMap };
+  // ✅ FIX: nếu latex rỗng nhưng có ảnh fallback => đổi token math thành img token ngay tại vị trí công thức
+  let outXml = docXml;
+  for (const key of Object.keys(found)) {
+    const fbKey = `fallback_${key}`;
+    if (!latexMap[key] && images[fbKey]) {
+      outXml = outXml.replaceAll(`[!m:$$${key}$$]`, `[!img:$$${fbKey}$$]`);
+      outXml = outXml.replaceAll(`[!m:$${key}$]`, `[!img:$$${fbKey}$$]`);
+    }
+  }
+
+  return { outXml, latexMap };
 }
 
 /* ================= Images AFTER MathType ================= */
