@@ -1,20 +1,8 @@
-// server.js
-// ✅ FULL CODE (FIX: PHẦN đúng vị trí + FIX mất căn thức \sqrt + FIX MathML prefix m:)
-// - Server trả `blocks` đã trộn section + question đúng thứ tự (frontend render chuẩn như Word)
-// - MathType OLE -> MathML -> LaTeX
-// - FIX: MathML namespaced tags <m:msqrt> / <m:math> => strip prefix để converter nhận đúng
-// - FIX: menclose notation="radical" => msqrt
-// - FIX: mo √ ... => msqrt
-// - ✅ HARD FIX: Tokenize <msqrt>/<mroot> BEFORE convert, then restore => gần như không thể rơi \sqrt
-// - ✅ Stability: giới hạn song song khi convert OLE để tránh quá tải (MATH_CONCURRENCY)
-//
-// Chạy: node server.js
-// Yêu cầu: inkscape (convert emf/wmf), ruby + mt2mml.rb (fallback MathType)
-// npm i express multer unzipper cors mathml-to-latex
-//
-// ENV:
-// - PORT (default 3000)
-// - MATH_CONCURRENCY (default 3)
+// server da bo sung phan hoan chinh theo goc.js
+// Merged preserve-order renderParagraph into original server flow
+// Usage: node "server da bo sung phan hoan chinh theo goc.js"
+// Requires: ruby + mt2mml.rb (or mt2mml_v2.rb), libreoffice/imagemagick/inkscape optional
+// npm i express multer unzipper cors fast-xml-parser mathml-to-latex p-limit
 
 import express from "express";
 import multer from "multer";
@@ -23,45 +11,43 @@ import cors from "cors";
 import fs from "fs";
 import os from "os";
 import path from "path";
-import crypto from "crypto";
-import { execFile, execFileSync } from "child_process";
+import { execFileSync, execFile, execSync } from "child_process";
+import { XMLParser } from "fast-xml-parser";
 import { MathMLToLaTeX } from "mathml-to-latex";
+import crypto from "crypto";
+import pLimit from "p-limit";
 
 const app = express();
 app.use(cors());
+app.use(express.json({ limit: "25mb" }));
 
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 50 * 1024 * 1024 },
 });
 
-/* ================= Helpers ================= */
-
-function parseRels(relsXml) {
-  const map = new Map();
-  const re =
-    /<Relationship\b[^>]*\bId="([^"]+)"[^>]*\bTarget="([^"]+)"[^>]*\/>/g;
-  let m;
-  while ((m = re.exec(relsXml))) map.set(m[1], m[2]);
-  return map;
+/* ================= Utilities ================= */
+function safeUnlink(p) {
+  try { fs.unlinkSync(p); } catch {}
 }
-
-function normalizeTargetToWordPath(target) {
-  let t = (target || "").replace(/^(\.\.\/)+/, "");
-  if (!t.startsWith("word/")) t = `word/${t}`;
-  return t;
+function safeRmdir(dir) {
+  try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
 }
-
-function extOf(p = "") {
-  return p.split(".").pop()?.toLowerCase() || "";
+function uniqueTmpPath(baseName = "oleObject.bin") {
+  const safe = path.basename(baseName).replace(/[^\w.\-]/g, "_");
+  return path.join(
+    os.tmpdir(),
+    `${Date.now()}_${Math.random().toString(16).slice(2)}_${safe}`
+  );
 }
-
-function guessMimeFromFilename(filename = "") {
-  const ext = extOf(filename);
+function getExtFromPath(p) {
+  return (p.split(".").pop() || "").toLowerCase();
+}
+function mimeFromExt(p) {
+  const ext = getExtFromPath(p);
   if (ext === "png") return "image/png";
   if (ext === "jpg" || ext === "jpeg") return "image/jpeg";
   if (ext === "gif") return "image/gif";
-  if (ext === "bmp") return "image/bmp";
   if (ext === "webp") return "image/webp";
   if (ext === "svg") return "image/svg+xml";
   if (ext === "emf") return "image/emf";
@@ -69,1471 +55,861 @@ function guessMimeFromFilename(filename = "") {
   return "application/octet-stream";
 }
 
-function decodeXmlEntities(s = "") {
-  return s
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&amp;/g, "&")
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'")
-    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(parseInt(n, 10)))
-    .replace(/&#x([0-9a-fA-F]+);/g, (_, h) =>
-      String.fromCharCode(parseInt(h, 16))
-    );
+/* ================== ZIP helpers ================== */
+async function openDocxZip(docxBuffer) {
+  return unzipper.Open.buffer(docxBuffer);
 }
-
-async function getZipEntryBuffer(zipFiles, p) {
-  const f = zipFiles.find((x) => x.path === p);
+async function readZipEntry(zip, p) {
+  const f = (zip.files || []).find((x) => x.path === p);
   if (!f) return null;
   return await f.buffer();
 }
 
-function sha1(buf) {
-  return crypto.createHash("sha1").update(buf).digest("hex");
+/* ================== RELS MAP ================== */
+function buildRelMaps(relsXmlText) {
+  const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "@_" });
+  const rels = parser.parse(relsXmlText);
+  const list = rels?.Relationships?.Relationship || [];
+  const arr = Array.isArray(list) ? list : [list];
+
+  const emb = {};
+  const media = {};
+  for (const r of arr) {
+    const id = r?.["@_Id"];
+    const target = r?.["@_Target"];
+    const targetMode = r?.["@_TargetMode"];
+    if (!id || !target) continue;
+    if (targetMode && String(targetMode).toLowerCase() === "external") continue;
+
+    const t = String(target).replace(/^\.?\//, "");
+    const low = t.toLowerCase();
+    if (low.startsWith("embeddings/") && low.endsWith(".bin")) emb[id] = "word/" + t;
+    else if (low.startsWith("media/")) media[id] = "word/" + t;
+  }
+  return { emb, media };
 }
 
-/* ================= Simple concurrency limiter ================= */
-
-function createLimiter(max = 3) {
-  let active = 0;
-  const q = [];
-  const next = () => {
-    if (active >= max) return;
-    const job = q.shift();
-    if (!job) return;
-    active++;
-    Promise.resolve()
-      .then(job.fn)
-      .then(job.resolve, job.reject)
-      .finally(() => {
-        active--;
-        next();
-      });
-  };
-  return function limit(fn) {
-    return new Promise((resolve, reject) => {
-      q.push({ fn, resolve, reject });
-      next();
-    });
-  };
-}
-
-/* ================= Inkscape Convert EMF/WMF -> PNG ================= */
-
-function inkscapeConvertToPng(inputPath, outputPath) {
-  return new Promise((resolve, reject) => {
-    execFile(
-      "inkscape",
-      [
-        inputPath,
-        "--export-type=png",
-        `--export-filename=${outputPath}`,
-        "--export-area-drawing",
-        "--export-background-opacity=0",
-      ],
-      { timeout: 30000 },
-      (err, stdout, stderr) => {
-        if (err) return reject(new Error(stderr || err.message));
-        resolve(true);
-      }
-    );
-  });
-}
-
-async function maybeConvertEmfWmfToPng(buf, filename) {
-  const ext = extOf(filename);
-  if (ext !== "emf" && ext !== "wmf") return null;
-
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mtype-"));
-  const inPath = path.join(tmpDir, `in.${ext}`);
-  const outPath = path.join(tmpDir, "out.png");
+/* ================== EMF/WMF -> PNG CONVERSION ================== */
+function convertEmfWmfToPng(buffer, ext) {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "img-convert-"));
+  const inFile = path.join(tmpDir, `input.${ext}`);
 
   try {
-    fs.writeFileSync(inPath, buf);
-    await inkscapeConvertToPng(inPath, outPath);
-    return fs.readFileSync(outPath);
-  } finally {
+    fs.writeFileSync(inFile, buffer);
+
     try {
-      fs.rmSync(tmpDir, { recursive: true, force: true });
-    } catch {}
-  }
-}
+      execSync(
+        `soffice --headless --convert-to png "${inFile}" --outdir "${tmpDir}"`,
+        { stdio: "ignore", timeout: 30000 }
+      );
 
-/* ================= MathType OLE -> MathML -> LaTeX ================= */
-
-function extractMathMLFromOleScan(buf) {
-  // try utf8 <math>
-  const utf8 = buf.toString("utf8");
-  let i = utf8.indexOf("<math");
-  if (i !== -1) {
-    let j = utf8.indexOf("</math>", i);
-    if (j !== -1) return utf8.slice(i, j + 7);
-  }
-
-  // try utf8 namespaced <m:math>
-  i = utf8.indexOf("<m:math");
-  if (i !== -1) {
-    let j = utf8.indexOf("</m:math>", i);
-    if (j !== -1) return utf8.slice(i, j + 9);
-  }
-
-  // try utf16le <math>
-  const u16 = buf.toString("utf16le");
-  i = u16.indexOf("<math");
-  if (i !== -1) {
-    let j = u16.indexOf("</math>", i);
-    if (j !== -1) return u16.slice(i, j + 7);
-  }
-
-  // try utf16le <m:math>
-  i = u16.indexOf("<m:math");
-  if (i !== -1) {
-    let j = u16.indexOf("</m:math>", i);
-    if (j !== -1) return u16.slice(i, j + 9);
-  }
-
-  return null;
-}
-
-function rubyOleToMathML(oleBuf) {
-  return new Promise((resolve, reject) => {
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ole-"));
-    const inPath = path.join(tmpDir, "oleObject.bin");
-    fs.writeFileSync(inPath, oleBuf);
-
-    execFile(
-      "ruby",
-      ["mt2mml.rb", inPath],
-      { timeout: 30000, maxBuffer: 20 * 1024 * 1024 },
-      (err, stdout, stderr) => {
-        try {
-          fs.rmSync(tmpDir, { recursive: true, force: true });
-        } catch {}
-        if (err) return reject(new Error(stderr || err.message));
-        resolve(String(stdout || "").trim());
+      const pngFile = fs.readdirSync(tmpDir).find(f => f.endsWith(".png"));
+      if (pngFile) {
+        return fs.readFileSync(path.join(tmpDir, pngFile));
       }
+    } catch (loErr) {
+      // ignore
+    }
+
+    try {
+      const outFile = path.join(tmpDir, "output.png");
+      execSync(`convert "${inFile}" "${outFile}"`, { stdio: "ignore", timeout: 30000 });
+      if (fs.existsSync(outFile)) {
+        return fs.readFileSync(outFile);
+      }
+    } catch (imErr) {
+      // ignore
+    }
+
+    return null;
+  } catch (e) {
+    return null;
+  } finally {
+    safeRmdir(tmpDir);
+  }
+}
+
+/* ================== RUBY OLE(.bin) -> MATHML (with cache & concurrency) ================== */
+const oleCache = new Map();
+const rubyLimit = pLimit(3);
+
+function rubyConvertOleBinToMathML(oleBinBuffer, filenameForTmp) {
+  const tmpPath = uniqueTmpPath(path.basename(filenameForTmp || "oleObject.bin"));
+  fs.writeFileSync(tmpPath, oleBinBuffer);
+
+  try {
+    const v2Script = path.join(process.cwd(), "mt2mml_v2.rb");
+    const v1Script = path.join(process.cwd(), "mt2mml.rb");
+    const scriptToUse = fs.existsSync(v2Script) ? v2Script : v1Script;
+
+    const out = execFileSync(
+      "ruby",
+      [scriptToUse, tmpPath],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 30000 }
     );
-  });
+
+    let mathml = "";
+    try {
+      const parsed = JSON.parse(out);
+      mathml = parsed.mathml || "";
+    } catch {
+      mathml = (out || "").trim();
+    }
+
+    if (!mathml || !mathml.startsWith("<")) return "";
+    return mathml;
+  } catch (e) {
+    return "";
+  } finally {
+    safeUnlink(tmpPath);
+  }
 }
 
-/* ================== MathML preprocess ================== */
-
-const SQRT_MATHML_RE =
-  /(msqrt|mroot|menclose|radical|√|&#8730;|&#x221a;|&#x221A;|&radic;)/i;
-
-function stripMathMLTagPrefixes(mathml) {
-  if (!mathml) return mathml;
-  let s = String(mathml);
-  // Strip common namespace prefixes in tags: m:, mml:, math:
-  s = s.replace(/<\s*\/\s*(m|mml|math)\s*:/gi, "</");
-  s = s.replace(/<\s*(m|mml|math)\s*:/gi, "<");
-  return s;
+async function rubyConvertWithCache(buf, filename) {
+  const key = crypto.createHash("sha1").update(buf).digest("hex");
+  if (oleCache.has(key)) {
+    const v = oleCache.get(key);
+    return typeof v === "string" ? v : await v;
+  }
+  const p = rubyLimit(() => rubyConvertOleBinToMathML(buf, filename));
+  oleCache.set(key, p);
+  const res = await p;
+  oleCache.set(key, res || "");
+  return res;
 }
 
-function ensureMathMLNamespace(mathml) {
-  if (!mathml) return mathml;
-  let s = String(mathml).replace(/<\?xml[^>]*\?>/gi, "").trim();
-  // only add xmlns for <math ...> if missing
-  s = s.replace(
-    /<math(?![^>]*\bxmlns=)/i,
-    '<math xmlns="http://www.w3.org/1998/Math/MathML"'
-  );
-  return s;
-}
-
-function normalizeMtable(mathml) {
-  if (!mathml) return mathml;
-  return String(mathml).replace(/<mtable\b[^>]*>/gi, "<mtable>");
-}
-
-// menclose radical -> msqrt + mo √ -> msqrt
+/* ================== MATHML -> LATEX (safe) ================== */
 function preprocessMathMLForSqrt(mathml) {
   if (!mathml) return mathml;
-  let s = stripMathMLTagPrefixes(String(mathml));
-
-  // 1) menclose radical -> msqrt
-  s = s.replace(
-    /<menclose\b([^>]*)\bnotation\s*=\s*["']radical["']([^>]*)>([\s\S]*?)<\/menclose>/gi,
-    "<msqrt>$3</msqrt>"
-  );
-
-  // 2) <mo>√</mo> + next node -> msqrt
-  const moSqrt =
-    String.raw`<mo>\s*(?:√|&#8730;|&#x221a;|&#x221A;|&radic;)\s*<\/mo>`;
-
-  s = s.replace(
-    new RegExp(moSqrt + String.raw`\s*<mrow>([\s\S]*?)<\/mrow>`, "gi"),
-    "<msqrt>$1</msqrt>"
-  );
-  s = s.replace(
-    new RegExp(moSqrt + String.raw`\s*<mi>([^<]+)<\/mi>`, "gi"),
-    "<msqrt><mi>$1</mi></msqrt>"
-  );
-  s = s.replace(
-    new RegExp(moSqrt + String.raw`\s*<mn>([^<]+)<\/mn>`, "gi"),
-    "<msqrt><mn>$1</mn></msqrt>"
-  );
-  s = s.replace(
-    new RegExp(
-      moSqrt + String.raw`\s*<mfenced([^>]*)>([\s\S]*?)<\/mfenced>`,
-      "gi"
-    ),
-    "<msqrt><mfenced$1>$2</mfenced></msqrt>"
-  );
-
-  return s;
-}
-
-/* ================== LATEX POSTPROCESS + SQRT FIX ================== */
-
-function sanitizeLatexStrict(latex) {
-  if (!latex) return latex;
-  latex = String(latex).replace(/\s+/g, " ").trim();
-
-  latex = latex
-    .replace(
-      /\\left(?!\s*(\(|\[|\\\{|\\langle|\\vert|\\\||\||\.))/g,
-      ""
-    )
-    .replace(
-      /\\right(?!\s*(\)|\]|\\\}|\\rangle|\\vert|\\\||\||\.))/g,
-      ""
-    );
-
-  const tokens = latex.match(/\\left\b|\\right\b/g) || [];
-  let bal = 0;
-  let broken = false;
-  for (const t of tokens) {
-    if (t === "\\left") bal++;
-    else {
-      if (bal === 0) {
-        broken = true;
-        break;
-      }
-      bal--;
-    }
-  }
-  if (bal !== 0) broken = true;
-
-  if (broken) latex = latex.replace(/\\left\s*/g, "").replace(/\\right\s*/g, "");
-  return latex;
-}
-
-function fixSetBracesHard(latex) {
-  let s = String(latex || "");
-
-  s = s.replace(
-    /\\underset\s*\{([^}]*)\}\s*\{\s*l\s*i\s*m\s*\}/gi,
-    "\\underset{$1}{\\lim}"
-  );
-  s = s.replace(/\b(l)\s+(i)\s+(m)\b/gi, "lim");
-  s = s.replace(/(^|[^A-Za-z\\])lim([^A-Za-z]|$)/g, "$1\\lim$2");
-
-  s = s.replace(/\\arrow\b/g, "\\rightarrow");
-  s = s.replace(/\bxarrow\b/g, "x\\rightarrow");
-  s = s.replace(/\\xarrow\b/g, "\\xrightarrow");
-
-  s = s.replace(/\\\{\s*\./g, "\\{");
-  s = s.replace(/\.\s*\\\}/g, "\\}");
-  s = s.replace(/\\\}\s*\./g, "\\}");
-
-  s = s.replace(/\\mathbb\{([A-Za-z])\\\}/g, "\\mathbb{$1}");
-  s = s.replace(/\\mathbb\{([A-Za-z])\}\s*\.\s*\}/g, "\\mathbb{$1}}");
-
-  s = s.replace(/\\backslash\s*{(?!\\)/g, "\\backslash \\{");
-  s = s.replace(/\\setminus\s*{(?!\\)/g, "\\setminus \\{");
-
-  if (
-    (s.includes("\\backslash \\{") || s.includes("\\setminus \\{")) &&
-    !s.includes("\\}")
-  ) {
-    s = s.replace(/\}\s*$/g, "").trim() + "\\}";
-  }
-
-  s = s.replace(/\\\}\s*([,.;:])/g, "\\}$1");
-
-  s = s.replace(/\\frac\{([^}]*)\}\{([^}]*)\}/g, (m, a, b) => {
-    const bb = String(b).replace(/(\d)\s+(\d)/g, "$1$2");
-    return `\\frac{${a}}{${bb}}`;
-  });
-
-  s = s.replace(/\s+/g, " ").trim();
-  return s;
-}
-
-function restoreArrowAndCoreCommands(latex) {
-  let s = String(latex || "");
-  s = s.replace(/\s+/g, " ").trim();
-  s = s.replace(/\b([A-Za-z])\s+arrow\b/g, "$1 \\to");
-  s = s.replace(/\brightarrow\b/g, "\\rightarrow");
-  s = s.replace(/\barrow\b/g, "\\rightarrow");
-  s = s.replace(/(^|[^A-Za-z\\])to([^A-Za-z]|$)/g, "$1\\to$2");
-  return s.replace(/\s+/g, " ").trim();
-}
-
-function fixPiecewiseFunction(latex) {
-  let s = String(latex || "");
-
-  s = s.replace(/\(\.\s+/g, "(");
-  s = s.replace(/\s+\.\)/g, ")");
-  s = s.replace(/\[\.\s+/g, "[");
-  s = s.replace(/\s+\.\]/g, "]");
-
-  const piecewiseMatch = s.match(/(?<!\\)\{\.\s+/);
-  if (piecewiseMatch) {
-    const startIdx = piecewiseMatch.index;
-    const contentStart = startIdx + piecewiseMatch[0].length;
-
-    let braceCount = 1;
-    let endIdx = contentStart;
-    let foundEnd = false;
-
-    for (let i = contentStart; i < s.length; i++) {
-      const ch = s[i];
-      const prevCh = i > 0 ? s[i - 1] : "";
-      if (prevCh === "\\") continue;
-
-      if (ch === "{") braceCount++;
-      else if (ch === "}") {
-        braceCount--;
-        if (braceCount === 0) {
-          endIdx = i;
-          foundEnd = true;
-          break;
-        }
-      }
-    }
-
-    if (!foundEnd) endIdx = s.length;
-
-    let content = s.slice(contentStart, endIdx).trim();
-    content = content.replace(/\s+\.\s*$/, "");
-    content = content.replace(/\s+\\\s+(?=\d)/g, " \\\\ ");
-
-    const before = s.slice(0, startIdx);
-    const after = foundEnd ? s.slice(endIdx + 1) : "";
-    s = before + `\\begin{cases} ${content} \\end{cases}` + after;
-  }
-
+  let s = String(mathml);
+  const moSqrt = String.raw`<mo>\s*(?:√|&#8730;|&#x221a;|&#x221A;|&radic;)\s*<\/mo>`;
+  s = s.replace(new RegExp(moSqrt + String.raw`\s*<mrow>([\s\S]*?)<\/mrow>`, "gi"), "<msqrt>$1</msqrt>");
+  s = s.replace(new RegExp(moSqrt + String.raw`\s*<mi>([^<]+)<\/mi>`, "gi"), "<msqrt><mi>$1</mi></msqrt>");
+  s = s.replace(new RegExp(moSqrt + String.raw`\s*<mn>([^<]+)<\/mn>`, "gi"), "<msqrt><mn>$1</mn></msqrt>");
+  s = s.replace(new RegExp(moSqrt + String.raw`\s*<mfenced([^>]*)>([\s\S]*?)<\/mfenced>`, "gi"), "<msqrt><mfenced$1>$2</mfenced></msqrt>");
   return s;
 }
 
 function postprocessLatexSqrt(latex) {
   if (!latex) return latex;
   let s = String(latex);
-
-  // Some converters output \surd instead of \sqrt
-  s = s.replace(/\\surd\b/g, "\\sqrt{}");
-
-  // literal sqrt remained
-  s = s.replace(/√\s*\{([^}]+)\}/g, "\\sqrt{$1}");
-  s = s.replace(/√\s*\(([^)]+)\)/g, "\\sqrt{$1}");
-  s = s.replace(/√\s*(\d+)/g, "\\sqrt{$1}");
-  s = s.replace(/√\s*([a-zA-Z])/g, "\\sqrt{$1}");
-
-  // \sqrt without braces
-  s = s.replace(/\\sqrt\s+(\d+)(?![}\d])/g, "\\sqrt{$1}");
-  s = s.replace(/\\sqrt\s+([a-zA-Z])(?![}\w])/g, "\\sqrt{$1}");
-
-  // empty sqrt
-  s = s.replace(/\\sqrt\s*\{\s*\}/g, "\\sqrt{\\phantom{x}}");
-
-  // malformed spaces
-  s = s.replace(/\\sqrt\s+\{/g, "\\sqrt{");
-
-  // nth root \root{n}\of{x} -> \sqrt[n]{x}
-  s = s.replace(
-    /\\root\s*\{([^}]+)\}\s*\\of\s*\{([^}]+)\}/g,
-    "\\sqrt[$1]{$2}"
-  );
-  s = s.replace(/\\sqrt\s*\[\s*(\d+)\s*\]\s*\{/g, "\\sqrt[$1]{");
-
+  s = s.replace(/\\surd\b/g, '\\sqrt{}');
+  s = s.replace(/√\s*\{([^}]+)\}/g, '\\sqrt{$1}');
+  s = s.replace(/√\s*\(([^)]+)\)/g, '\\sqrt{$1}');
+  s = s.replace(/√\s*(\d+)/g, '\\sqrt{$1}');
+  s = s.replace(/√\s*([a-zA-Z])/g, '\\sqrt{$1}');
+  s = s.replace(/\\sqrt\s+(\d+)(?![}\d])/g, '\\sqrt{$1}');
+  s = s.replace(/\\sqrt\s+([a-zA-Z])(?![}\w])/g, '\\sqrt{$1}');
+  s = s.replace(/\\sqrt\s*\{\s*\}/g, '\\sqrt{\\phantom{x}}');
+  s = s.replace(/\\root\s*\{([^}]+)\}\s*\\of\s*\{([^}]+)\}/g, '\\sqrt[$1]{$2}');
+  s = s.replace(/\\sqrt\s*\[\s*(\d+)\s*\]\s*\{/g, '\\sqrt[$1]{');
   return s;
 }
 
-/**
- * ✅ HARD WRAP:
- * If MathML had sqrt/root but LaTeX output has no \sqrt => wrap result in \sqrt{...}
- */
-function fixSqrtLatex(latex, mathmlMaybe = "") {
-  let s = String(latex || "").trim();
-  const mml = stripMathMLTagPrefixes(String(mathmlMaybe || ""));
-
-  const mmlHasSqrt =
-    SQRT_MATHML_RE.test(mml) ||
-    /<msqrt\b/i.test(mml) ||
-    /<mroot\b/i.test(mml) ||
-    /<menclose\b[^>]*notation\s*=\s*["']radical["']/i.test(mml);
-
-  const latexHasSqrt = /\\sqrt\b|\\root\b/.test(s);
-
-  if (mmlHasSqrt && !latexHasSqrt) {
-    if (!s) return "\\sqrt{}";
-    return `\\sqrt{${s}}`;
-  }
-
-  return s;
-}
-
-function postProcessLatex(latex, mathmlMaybe = "") {
-  let s = latex || "";
-  s = sanitizeLatexStrict(s);
-  s = fixSetBracesHard(s);
-  s = restoreArrowAndCoreCommands(s);
-  s = fixPiecewiseFunction(s);
-
-  // soft sqrt fixes
-  s = postprocessLatexSqrt(s);
-
-  // hard wrap last
-  s = fixSqrtLatex(s, mathmlMaybe);
-
-  return String(s || "").replace(/\s+/g, " ").trim();
-}
-
-/* ================= ✅ SQRT TOKEN CONVERTER (KHÓ RƠI CĂN NHẤT) ================= */
-
-/** Find balanced tag blocks <tag ...> ... </tag> */
-function extractBalancedTagBlocks(xml, tagName) {
-  const blocks = [];
-  const openRe = new RegExp(`<${tagName}\\b[^>]*>`, "ig");
-  const closeRe = new RegExp(`</${tagName}>`, "ig");
-
-  let m;
-  while ((m = openRe.exec(xml)) !== null) {
-    const start = m.index;
-    const openLen = m[0].length;
-
-    let depth = 1;
-    let i = start + openLen;
-
-    while (depth > 0) {
-      const nextOpen = openRe.exec(xml);
-      const nextClose = closeRe.exec(xml);
-
-      const o = nextOpen ? nextOpen.index : Infinity;
-      const c = nextClose ? nextClose.index : Infinity;
-
-      if (c === Infinity) break; // malformed
-
-      if (o < c) {
-        depth++;
-        i = o + (nextOpen[0] ? nextOpen[0].length : 0);
-      } else {
-        depth--;
-        i = c + (nextClose[0] ? nextClose[0].length : 0);
-      }
-    }
-
-    const end = i;
-    if (end > start) {
-      blocks.push({ start, end, xml: xml.slice(start, end) });
-      // reset regex lastIndex to continue AFTER this block
-      openRe.lastIndex = start + 1;
-      closeRe.lastIndex = start + 1;
-    }
-  }
-
-  blocks.sort((a, b) => a.start - b.start);
-  return blocks;
-}
-
-/** Split direct children inside <mroot> ... </mroot> into [base, index] (heuristic good for mt2mml output) */
-function splitMrootChildren(innerXml) {
-  const s = innerXml.trim();
-  let depth = 0;
-  let cut = -1;
-
-  for (let i = 0; i < s.length; i++) {
-    if (s[i] === "<") {
-      if (s.slice(i, i + 2) === "</") depth--;
-      else if (s.slice(i, i + 5).toLowerCase() === "<mrow") depth++;
-      else if (s.slice(i, i + 3).toLowerCase() === "<mi") depth++;
-      else if (s.slice(i, i + 3).toLowerCase() === "<mn") depth++;
-      else if (s.slice(i, i + 3).toLowerCase() === "<mo") depth++;
-      else if (s.slice(i, i + 6).toLowerCase() === "<msqrt") depth++;
-      else if (s.slice(i, i + 6).toLowerCase() === "<mroot") depth++;
-      else if (s.slice(i, i + 9).toLowerCase() === "<menclose") depth++;
-    }
-
-    // boundary when first element closed at top level
-    if (depth === 0 && i > 0) {
-      const maybe = s.slice(0, i + 1);
-      if (/<\/\w+>\s*$/.test(maybe)) {
-        cut = i + 1;
-        break;
-      }
-    }
-  }
-
-  if (cut < 0) return [s, ""];
-  const a = s.slice(0, cut).trim();
-  const b = s.slice(cut).trim();
-  return [a, b];
-}
-
-/**
- * Replace all <msqrt>/<mroot> blocks by tokens BEFORE MathMLToLaTeX.convert,
- * then restore tokens into \sqrt{...} / \sqrt[n]{...}
- */
-function convertMathMLWithSqrtTokens(mathml) {
-  let mm = stripMathMLTagPrefixes(String(mathml || "")).trim();
-
-  // wrap if body-only
-  const hasMathTag = /<\s*math\b/i.test(mm);
-  const looksLikeBody =
-    /<(mrow|mi|mn|mo|msqrt|mroot|mfrac|msup|msub|msubsup|menclose)\b/i.test(mm);
-  if (!hasMathTag && looksLikeBody) {
-    mm = `<math xmlns="http://www.w3.org/1998/Math/MathML">${mm}</math>`;
-  }
-  if (!/<\s*math\b/i.test(mm)) return "";
-
-  mm = ensureMathMLNamespace(mm);
-  mm = normalizeMtable(mm);
-  mm = preprocessMathMLForSqrt(mm);
-
-  // extract blocks
-  const sqrtBlocks = extractBalancedTagBlocks(mm, "msqrt");
-  const rootBlocks = extractBalancedTagBlocks(mm, "mroot");
-
-  const tokenMap = []; // { token, type, xml }
-  let replaced = mm;
-
-  // replace from back to front to keep indices valid
-  const all = [
-    ...sqrtBlocks.map((b) => ({ ...b, type: "msqrt" })),
-    ...rootBlocks.map((b) => ({ ...b, type: "mroot" })),
-  ].sort((a, b) => b.start - a.start);
-
-  let k = 0;
-  for (const b of all) {
-    const token = `__SQRT_TOKEN_${++k}__`;
-    tokenMap.push({ token, type: b.type, xml: b.xml });
-
-    // replace whole block with a harmless identifier node
-    replaced =
-      replaced.slice(0, b.start) + `<mi>${token}</mi>` + replaced.slice(b.end);
-  }
-
-  // convert the big expression (sqrt removed)
-  let latexMain = "";
-  try {
-    latexMain = (MathMLToLaTeX.convert(replaced) || "").trim();
-  } catch {
-    latexMain = "";
-  }
-
-  // restore each token with manual sqrt/root conversion
-  for (const item of tokenMap) {
-    let latexRep = "";
-
-    if (item.type === "msqrt") {
-      const inner = item.xml
-        .replace(/^<msqrt\b[^>]*>/i, "")
-        .replace(/<\/msqrt>\s*$/i, "");
-      const innerLatex = convertMathMLWithSqrtTokens(
-        `<math xmlns="http://www.w3.org/1998/Math/MathML">${inner}</math>`
-      );
-      latexRep = `\\sqrt{${innerLatex || ""}}`;
-    } else {
-      const inner = item.xml
-        .replace(/^<mroot\b[^>]*>/i, "")
-        .replace(/<\/mroot>\s*$/i, "");
-      const [baseXml, indexXml] = splitMrootChildren(inner);
-
-      const baseLatex = convertMathMLWithSqrtTokens(
-        `<math xmlns="http://www.w3.org/1998/Math/MathML">${baseXml}</math>`
-      );
-      const idxLatex = convertMathMLWithSqrtTokens(
-        `<math xmlns="http://www.w3.org/1998/Math/MathML">${indexXml}</math>`
-      );
-      latexRep = `\\sqrt[${idxLatex || ""}]{${baseLatex || ""}}`;
-    }
-
-    // replace token in latex output (token was in <mi>)
-    const re = new RegExp(
-      item.token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
-      "g"
-    );
-    latexMain = latexMain.replace(re, latexRep);
-  }
-
-  return latexMain.trim();
-}
-
-/* ================= ✅ Safe MathML -> LaTeX (uses token converter) ================= */
-
-/**
- * Accept MathML:
- * - <math ...>...</math>
- * - <m:math ...>...</m:math>   (we strip prefix)
- * - or only body (<mrow>...</mrow>, <msqrt>...) => auto-wrap into <math>
- */
-
-/* ================== MathML NORMALIZE + HARD SQRT GUARANTEE ==================
- * Mục tiêu:
- * 1) Chuẩn hoá MathML mt2mml/MathType hay sinh lỗi (prefix m:, menclose radical, mo √, msup base rỗng...)
- * 2) ĐẢM BẢO không rơi căn: token hoá <msqrt>/<mroot> trước khi MathMLToLaTeX.convert rồi restore về \sqrt
- * 3) Tuỳ chọn debug để biết OLE nào có sqrt nhưng LaTeX không có \sqrt
- */
-
-function stripMathMLTagPrefixes(mathml) {
-  if (!mathml) return mathml;
-  let s = String(mathml);
-  s = s.replace(/<\s*\/\s*(m|mml|math)\s*:/gi, "</");
-  s = s.replace(/<\s*(m|mml|math)\s*:/gi, "<");
-  return s;
-}
-
-function ensureMathMLNamespace(mathml) {
-  if (!mathml) return mathml;
-  let s = String(mathml).replace(/<\?xml[^>]*\?>/gi, "").trim();
-  s = s.replace(
-    /<math(?![^>]*\bxmlns=)/i,
-    '<math xmlns="http://www.w3.org/1998/Math/MathML"'
-  );
-  return s;
-}
-
-function normalizeMtable(mathml) {
-  if (!mathml) return mathml;
-  return String(mathml).replace(/<mtable\b[^>]*>/gi, "<mtable>");
-}
-
-// menclose radical -> msqrt  +  mo √ -> msqrt
-function preprocessMathMLForSqrt(mathml) {
-  if (!mathml) return mathml;
-  let s = stripMathMLTagPrefixes(String(mathml));
-
-  // menclose radical -> msqrt
-  s = s.replace(
-    /<menclose\b([^>]*)\bnotation\s*=\s*["']radical["']([^>]*)>([\s\S]*?)<\/menclose>/gi,
-    "<msqrt>$3</msqrt>"
-  );
-
-  // <mo>√</mo> ... -> <msqrt>...</msqrt>
-  const moSqrt =
-    String.raw`<mo>\s*(?:√|&#8730;|&#x221a;|&#x221A;|&radic;)\s*<\/mo>`;
-
-  s = s.replace(
-    new RegExp(moSqrt + String.raw`\s*<mrow>([\s\S]*?)<\/mrow>`, "gi"),
-    "<msqrt>$1</msqrt>"
-  );
-  s = s.replace(
-    new RegExp(moSqrt + String.raw`\s*<mi>([^<]+)<\/mi>`, "gi"),
-    "<msqrt><mi>$1</mi></msqrt>"
-  );
-  s = s.replace(
-    new RegExp(moSqrt + String.raw`\s*<mn>([^<]+)<\/mn>`, "gi"),
-    "<msqrt><mn>$1</mn></msqrt>"
-  );
-  s = s.replace(
-    new RegExp(
-      moSqrt + String.raw`\s*<mfenced([^>]*)>([\s\S]*?)<\/mfenced>`,
-      "gi"
-    ),
-    "<msqrt><mfenced$1>$2</mfenced></msqrt>"
-  );
-
-  return s;
-}
-
-/**
- * Fix MathML mt2mml hay sinh:
- *   <mi>y</mi><msup><mrow></mrow><mrow><mn>2</mn></mrow></msup>
- * => <msup><mi>y</mi><mn>2</mn></msup>
- */
-function fixBrokenMsup(mathml) {
-  if (!mathml) return mathml;
-  let s = String(mathml);
-
-  // Case: <mi>X</mi><msup><mrow></mrow><mrow>EXP</mrow></msup>
-  s = s.replace(
-    /<mi>([^<]+)<\/mi>\s*<msup>\s*<mrow>\s*<\/mrow>\s*<mrow>([\s\S]*?)<\/mrow>\s*<\/msup>/gi,
-    "<msup><mi>$1</mi><mrow>$2</mrow></msup>"
-  );
-
-  // Also accept <mrow></mrow> exponent container variants
-  s = s.replace(
-    /<mi>([^<]+)<\/mi>\s*<msup>\s*<mrow>\s*<\/mrow>\s*<mn>([^<]+)<\/mn>\s*<\/msup>/gi,
-    "<msup><mi>$1</mi><mn>$2</mn></msup>"
-  );
-
-  return s;
-}
-
-/**
- * Fix subscript "min" hay bị mt2mml tách chữ + mrow rỗng:
- * <mi>P</mi><msub><mrow><mi>m</mi><mi>i</mi><mi>n</mi></mrow><mrow></mrow></msub>
- * => <msub><mi>P</mi><mi>min</mi></msub>
- */
-function fixMinSubscript(mathml) {
-  if (!mathml) return mathml;
-  let s = String(mathml);
-
-  s = s.replace(
-    /<mi>P<\/mi>\s*<msub>\s*<mrow>\s*<mi>m<\/mi>\s*<mi>i<\/mi>\s*<mi>n<\/mi>\s*<\/mrow>\s*<mrow>\s*<\/mrow>\s*<\/msub>/gi,
-    "<msub><mi>P</mi><mi>min</mi></msub>"
-  );
-
-  return s;
-}
-
-/** ====== Helper: find balanced tag blocks <tag ...> ... </tag> ====== */
-function extractBalancedTagBlocks(xml, tagName) {
-  const blocks = [];
-  const openRe = new RegExp(`<${tagName}\\b[^>]*>`, "ig");
-  const closeRe = new RegExp(`</${tagName}>`, "ig");
-
-  let m;
-  while ((m = openRe.exec(xml)) !== null) {
-    const start = m.index;
-    const openLen = m[0].length;
-
-    let depth = 1;
-    let i = start + openLen;
-
-    while (depth > 0) {
-      const nextOpen = openRe.exec(xml);
-      const nextClose = closeRe.exec(xml);
-
-      const o = nextOpen ? nextOpen.index : Infinity;
-      const c = nextClose ? nextClose.index : Infinity;
-
-      if (c === Infinity) break;
-
-      if (o < c) {
-        depth++;
-        i = o + (nextOpen[0] ? nextOpen[0].length : 0);
-      } else {
-        depth--;
-        i = c + (nextClose[0] ? nextClose[0].length : 0);
-      }
-    }
-
-    const end = i;
-    if (end > start) {
-      blocks.push({ start, end, xml: xml.slice(start, end) });
-      // continue safely
-      openRe.lastIndex = start + 1;
-      closeRe.lastIndex = start + 1;
-    }
-  }
-
-  blocks.sort((a, b) => a.start - b.start);
-  return blocks;
-}
-
-/** Split direct children inside <mroot> ... </mroot> into [base, index] */
-function splitMrootChildren(innerXml) {
-  const s = innerXml.trim();
-  if (!s) return ["", ""];
-
-  // Find boundary by counting tag depth roughly at top-level
-  let depth = 0;
-  let cut = -1;
-
-  for (let i = 0; i < s.length; i++) {
-    if (s[i] === "<") {
-      if (s.slice(i, i + 2) === "</") {
-        depth = Math.max(0, depth - 1);
-      } else {
-        depth++;
-      }
-    }
-    if (depth === 0 && i > 0) {
-      const head = s.slice(0, i + 1);
-      if (/<\/\w+>\s*$/.test(head)) {
-        cut = i + 1;
-        break;
-      }
-    }
-  }
-
-  if (cut < 0) return [s, ""];
-  return [s.slice(0, cut).trim(), s.slice(cut).trim()];
-}
-
-/**
- * ✅ Core: Tokenize all <msqrt>/<mroot> blocks before MathMLToLaTeX.convert,
- * then restore tokens into \sqrt{...} / \sqrt[n]{...}
- */
-function convertMathMLWithSqrtTokens(mathml) {
-  let mm = stripMathMLTagPrefixes(String(mathml || "")).trim();
-
-  // Wrap body-only fragments into <math>
-  const hasMathTag = /<\s*math\b/i.test(mm);
-  const looksLikeBody =
-    /<(mrow|mi|mn|mo|msqrt|mroot|mfrac|msup|msub|msubsup|menclose)\b/i.test(mm);
-
-  if (!hasMathTag && looksLikeBody) {
-    mm = `<math xmlns="http://www.w3.org/1998/Math/MathML">${mm}</math>`;
-  }
-  if (!/<\s*math\b/i.test(mm)) return "";
-
-  // Normalize & fix
-  mm = ensureMathMLNamespace(mm);
-  mm = normalizeMtable(mm);
-  mm = preprocessMathMLForSqrt(mm);
-  mm = fixBrokenMsup(mm);
-  mm = fixMinSubscript(mm);
-
-  // Extract msqrt/mroot blocks
-  const sqrtBlocks = extractBalancedTagBlocks(mm, "msqrt");
-  const rootBlocks = extractBalancedTagBlocks(mm, "mroot");
-
-  const tokenMap = []; // { token, type, xml }
-  let replaced = mm;
-
-  const all = [
-    ...sqrtBlocks.map((b) => ({ ...b, type: "msqrt" })),
-    ...rootBlocks.map((b) => ({ ...b, type: "mroot" })),
-  ].sort((a, b) => b.start - a.start);
-
-  let k = 0;
-  for (const b of all) {
-    const token = `__SQRT_TOKEN_${++k}__`;
-    tokenMap.push({ token, type: b.type, xml: b.xml });
-    replaced =
-      replaced.slice(0, b.start) +
-      `<mi>${token}</mi>` +
-      replaced.slice(b.end);
-  }
-
-  // Convert main (without sqrt/root)
-  let latexMain = "";
-  try {
-    latexMain = (MathMLToLaTeX.convert(replaced) || "").trim();
-  } catch {
-    latexMain = "";
-  }
-
-  // Restore tokens (recursive conversion)
-  for (const item of tokenMap) {
-    let latexRep = "";
-
-    if (item.type === "msqrt") {
-      const inner = item.xml
-        .replace(/^<msqrt\b[^>]*>/i, "")
-        .replace(/<\/msqrt>\s*$/i, "");
-      const innerLatex = convertMathMLWithSqrtTokens(
-        `<math xmlns="http://www.w3.org/1998/Math/MathML">${inner}</math>`
-      );
-      latexRep = `\\sqrt{${innerLatex || ""}}`;
-    } else {
-      const inner = item.xml
-        .replace(/^<mroot\b[^>]*>/i, "")
-        .replace(/<\/mroot>\s*$/i, "");
-      const [baseXml, indexXml] = splitMrootChildren(inner);
-
-      const baseLatex = convertMathMLWithSqrtTokens(
-        `<math xmlns="http://www.w3.org/1998/Math/MathML">${baseXml}</math>`
-      );
-      const idxLatex = convertMathMLWithSqrtTokens(
-        `<math xmlns="http://www.w3.org/1998/Math/MathML">${indexXml}</math>`
-      );
-
-      latexRep = `\\sqrt[${idxLatex || ""}]{${baseLatex || ""}}`;
-    }
-
-    const re = new RegExp(
-      item.token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
-      "g"
-    );
-    latexMain = latexMain.replace(re, latexRep);
-  }
-
-  return latexMain.trim();
-}
-
-function mathmlToLatexSafe(mml) {
-  try {
-    if (!mml) return "";
-    const mm = String(mml);
-
-    // Convert with sqrt-token strategy (hard guarantee)
-    const latex0 = convertMathMLWithSqrtTokens(mm);
-
-    // Post-process (keep your existing pipeline)
-    return postProcessLatex((latex0 || "").trim(), mm);
-  } catch {
-    return "";
-  }
-}
-
-/* ================= MathType FIRST ================= */
-
-async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images, opts = {}) {
-  let idx = 0;
-  const found = {}; // key -> { oleTarget, previewRid, oleHash }
-  const OBJECT_RE = /<w:object[\s\S]*?<\/w:object>/g;
-
-  docXml = docXml.replace(OBJECT_RE, (block) => {
-    const ole = block.match(/<o:OLEObject\b[^>]*\br:id="([^"]+)"/);
-    if (!ole) return block;
-
-    const oleRid = ole[1];
-    const oleTarget = rels.get(oleRid);
-    if (!oleTarget) return block;
-
-    const vmlRid = block.match(
-      /<v:imagedata\b[^>]*\br:id="([^"]+)"[^>]*\/>/
-    );
-    const blipRid = block.match(
-      /<a:blip\b[^>]*\br:embed="([^"]+)"[^>]*\/>/
-    );
-    const previewRid = vmlRid?.[1] || blipRid?.[1] || null;
-
-    const key = `mathtype_${++idx}`;
-    found[key] = { oleTarget, previewRid, oleHash: null };
-    return `[!m:$${key}$]`;
+function manualMathMLToLatex(mathml) {
+  // lightweight manual fallback focusing on sqrt/mroot/mfrac
+  if (!mathml) return "";
+  const parser = new XMLParser({
+    ignoreAttributes: false,
+    attributeNamePrefix: "@_",
+    textNodeName: "#text",
+    preserveOrder: false,
   });
+  let parsed;
+  try { parsed = parser.parse(mathml); } catch { return ""; }
+  function nodeToLatex(node) {
+    if (!node) return "";
+    if (typeof node === "string") return node;
+    if (node["#text"] !== undefined) return String(node["#text"]);
+    if (Array.isArray(node)) return node.map(nodeToLatex).join("");
+    let res = "";
+    for (const [k, v] of Object.entries(node)) {
+      const tag = k.toLowerCase();
+      switch (tag) {
+        case "msqrt": res += `\\sqrt{${nodeToLatex(v)}}`; break;
+        case "mroot":
+          if (Array.isArray(v) && v.length >= 2) {
+            res += `\\sqrt[${nodeToLatex(v[1])}]{${nodeToLatex(v[0])}}`;
+          } else res += `\\sqrt{${nodeToLatex(v)}}`;
+          break;
+        case "mfrac":
+          if (Array.isArray(v) && v.length >= 2) res += `\\frac{${nodeToLatex(v[0])}}{${nodeToLatex(v[1])}}`;
+          else res += nodeToLatex(v);
+          break;
+        case "mi": case "mn": case "mtext": res += nodeToLatex(v); break;
+        case "mo": res += (nodeToLatex(v) || ""); break;
+        case "mrow": res += nodeToLatex(v); break;
+        default: res += nodeToLatex(v);
+      }
+    }
+    return res;
+  }
+  let out = nodeToLatex(parsed);
+  return out.replace(/\s+/g, " ").trim();
+}
 
-  const latexMap = {};
-  const debugMath = [];
-  const wantDebug = !!opts.debug;
-  const forcePreviewWhenSqrtMissing = !!opts.forcePreviewWhenSqrtMissing;
-  const oleCache = new Map(); // oleHash -> latex
-  const mmlCache = new Map(); // oleHash -> mml
-  const limit = createLimiter(
-    Math.max(1, Number(process.env.MATH_CONCURRENCY || 3))
-  );
+function mathmlToLatexSafe(mathml) {
+  if (!mathml || !mathml.includes("<math")) return "";
+  try {
+    const pre = preprocessMathMLForSqrt(mathml);
+    let latex = (MathMLToLaTeX.convert(pre) || "").trim();
+    if (!latex) latex = manualMathMLToLatex(pre);
+    latex = postprocessLatexSqrt(latex);
+    return latex.trim();
+  } catch {
+    return manualMathMLToLatex(mathml);
+  }
+}
 
-  await Promise.all(
-    Object.entries(found).map(([key, info]) =>
-      limit(async () => {
-        const oleFull = normalizeTargetToWordPath(info.oleTarget);
-        const oleBuf = await getZipEntryBuffer(zipFiles, oleFull);
+/* ================== PRESERVE-ORDER HELPERS (renderParagraph, renderTable, buildInlineHtml) ================== */
+function kids(arr, tag) {
+  return Array.isArray(arr) ? arr.filter((n) => n && typeof n === "object" && n[tag]) : [];
+}
+function findAllRidsDeep(x, out = []) {
+  const re = /^rId\d+$/;
+  if (!x) return out;
+  if (typeof x === "string") {
+    const s = x.trim();
+    if (re.test(s)) out.push(s);
+    return out;
+  }
+  if (Array.isArray(x)) {
+    for (const it of x) findAllRidsDeep(it, out);
+    return out;
+  }
+  if (typeof x === "object") {
+    for (const v of Object.values(x)) findAllRidsDeep(v, out);
+    return out;
+  }
+  return out;
+}
+function findImageEmbedRidsDeep(x, out = []) {
+  if (!x) return out;
+  if (Array.isArray(x)) {
+    for (const it of x) findImageEmbedRidsDeep(it, out);
+    return out;
+  }
+  if (typeof x === "object") {
+    for (const [k, v] of Object.entries(x)) {
+      if ((k === "@_r:embed" || k === "@_r:id") && typeof v === "string" && v.startsWith("rId")) out.push(v);
+      findImageEmbedRidsDeep(v, out);
+    }
+  }
+  return out;
+}
+function runHasOleLike(rNode) {
+  try {
+    const s = JSON.stringify(rNode);
+    return s.includes("o:OLEObject") || s.includes("w:object") || s.includes("w:oleObject");
+  } catch { return false; }
+}
+function runIsUnderlined(rNode) {
+  try {
+    const s = JSON.stringify(rNode);
+    if (!s.includes("w:u")) return false;
+    if (s.toLowerCase().includes("none")) return false;
+    return true;
+  } catch { return false; }
+}
+function getTextFromPreserveWrap(tagWrap, tagName) {
+  const v = tagWrap?.[tagName];
+  if (!v) return "";
+  if (Array.isArray(v)) return v.map((x) => x?.["#text"] || "").join("");
+  if (typeof v === "object") return v?.["#text"] || "";
+  return "";
+}
+function collectTextFromRun(rNode) {
+  let s = "";
+  for (const tWrap of kids(rNode, "w:t")) s += getTextFromPreserveWrap(tWrap, "w:t");
+  for (const tWrap of kids(rNode, "w:instrText")) s += getTextFromPreserveWrap(tWrap, "w:instrText");
+  for (const tWrap of kids(rNode, "w:delText")) s += getTextFromPreserveWrap(tWrap, "w:delText");
+  if (kids(rNode, "w:tab").length) s += "\t";
+  if (kids(rNode, "w:br").length) s += "\n";
+  return s;
+}
+function escapeTextToHtml(text) {
+  if (!text) return "";
+  return String(text)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll("\t", "&emsp;")
+    .replaceAll("\n", "<br/>");
+}
+function lastVisibleChar(html) {
+  const t = String(html || "").replace(/<[^>]*>/g, "");
+  return t.length ? t[t.length - 1] : "";
+}
+function appendMathWithOneSpace(html, mathSpan) {
+  const prev = lastVisibleChar(html);
+  if (prev && !/\s/.test(prev)) html += " ";
+  html += mathSpan;
+  html += " ";
+  return html;
+}
 
-        // No OLE => fallback preview image
-        if (!oleBuf) {
-          latexMap[key] = "";
-          return;
-        }
+function renderParagraph(pNode, ctx) {
+  const { latexByRid, imageByRid, debug } = ctx;
+  let html = "";
 
-        const h = sha1(oleBuf);
-        info.oleHash = h;
+  const runs = kids(pNode, "w:r");
+  for (const rWrap of runs) {
+    const rNode = rWrap["w:r"];
+    const under = runIsUnderlined(rNode);
 
-        // Cache latex by hash
-        if (oleCache.has(h)) {
-          latexMap[key] = oleCache.get(h) || "";
-          return;
-        }
-
-        let mml = mmlCache.get(h) || "";
-        if (!mml) mml = extractMathMLFromOleScan(oleBuf) || "";
-
-        if (!mml) {
-          try {
-            mml = await rubyOleToMathML(oleBuf);
-          } catch {
-            mml = "";
+    if (Array.isArray(rNode)) {
+      for (const child of rNode) {
+        if (child["w:t"]) {
+          const text = getTextFromPreserveWrap(child, "w:t");
+          if (text) {
+            const esc = escapeTextToHtml(text);
+            html += under ? `<u>${esc}</u>` : esc;
           }
         }
-        if (mml) mmlCache.set(h, mml);
 
-        const latex = mml ? mathmlToLatexSafe(mml) : "";
-        if (latex) {
-          latexMap[key] = latex;
-          oleCache.set(h, latex);
-          return;
+        if (child["w:tab"]) html += "&emsp;";
+        if (child["w:br"]) html += "<br/>";
+
+        if (child["a:blip"] || child["pic:blipFill"] || child["w:drawing"]) {
+          const imgRids = Array.from(new Set(findImageEmbedRidsDeep(child, [])));
+          for (const rid of imgRids) {
+            const dataUri = imageByRid[rid];
+            if (dataUri) {
+              debug.imagesInjected++;
+              html += `<img src="${dataUri}" style="max-width:100%;height:auto;vertical-align:middle;" />`;
+            }
+          }
         }
 
-        // fallback preview image if conversion failed
-        if (info.previewRid) {
-          const t = rels.get(info.previewRid);
-          if (t) {
-            const imgFull = normalizeTargetToWordPath(t);
-            const imgBuf = await getZipEntryBuffer(zipFiles, imgFull);
-            if (imgBuf) {
-              const mime = guessMimeFromFilename(imgFull);
-              if (mime === "image/emf" || mime === "image/wmf") {
-                try {
-                  const pngBuf = await maybeConvertEmfWmfToPng(imgBuf, imgFull);
-                  if (pngBuf) {
-                    images[`fallback_${key}`] = `data:image/png;base64,${pngBuf.toString(
-                      "base64"
-                    )}`;
-                    latexMap[key] = "";
-                    oleCache.set(h, "");
-                    return;
-                  }
-                } catch {}
+        if (child["w:pict"] || child["v:shape"]) {
+          const imgRids = Array.from(new Set(findImageEmbedRidsDeep(child, [])));
+          for (const rid of imgRids) {
+            const dataUri = imageByRid[rid];
+            if (dataUri) {
+              debug.imagesInjected++;
+              html += `<img src="${dataUri}" style="max-width:100%;height:auto;vertical-align:middle;" />`;
+            }
+          }
+        }
+
+        if (child["w:object"] || child["o:OLEObject"]) {
+          const allRids = Array.from(new Set(findAllRidsDeep(child, [])));
+
+          let foundMath = false;
+          for (const rid of allRids) {
+            const latex = latexByRid[rid];
+            if (latex) {
+              debug.seenOle++;
+              if (debug.sampleRids.length < 12) debug.sampleRids.push(rid);
+              const mathSpan = `<span class="math">\\(${latex}\\)</span>`;
+              html = appendMathWithOneSpace(html, mathSpan);
+              debug.oleInjected++;
+              foundMath = true;
+            }
+          }
+
+          if (!foundMath) {
+            const imgRids = Array.from(new Set(findImageEmbedRidsDeep(child, [])));
+            for (const rid of imgRids) {
+              const dataUri = imageByRid[rid];
+              if (dataUri) {
+                debug.imagesInjected++;
+                html += `<img src="${dataUri}" style="max-width:100%;height:auto;vertical-align:middle;" />`;
               }
-              images[`fallback_${key}`] = `data:${mime};base64,${imgBuf.toString(
-                "base64"
-              )}`;
             }
           }
         }
-
-        latexMap[key] = "";
-        oleCache.set(h, "");
-      })
-    )
-  );
-
-  return { outXml: docXml, latexMap, debugMath };
-}
-
-/* ================= Images AFTER MathType ================= */
-
-async function tokenizeImagesAfter(docXml, rels, zipFiles) {
-  let idx = 0;
-  const imgMap = {};
-  const jobs = [];
-
-  const schedule = (rid, key) => {
-    const target = rels.get(rid);
-    if (!target) return;
-    const full = normalizeTargetToWordPath(target);
-
-    jobs.push(
-      (async () => {
-        const buf = await getZipEntryBuffer(zipFiles, full);
-        if (!buf) return;
-
-        const mime = guessMimeFromFilename(full);
-        if (mime === "image/emf" || mime === "image/wmf") {
-          try {
-            const pngBuf = await maybeConvertEmfWmfToPng(buf, full);
-            if (pngBuf) {
-              imgMap[key] = `data:image/png;base64,${pngBuf.toString("base64")}`;
-              return;
-            }
-          } catch {}
-        }
-        imgMap[key] = `data:${mime};base64,${buf.toString("base64")}`;
-      })()
-    );
-  };
-
-  docXml = docXml.replace(
-    /<a:blip\b[^>]*\br:embed="([^"]+)"[^>]*\/>/g,
-    (m, rid) => {
-      const key = `img_${++idx}`;
-      schedule(rid, key);
-      return `[!img:$${key}$]`;
-    }
-  );
-
-  docXml = docXml.replace(
-    /<v:imagedata\b[^>]*\br:id="([^"]+)"[^>]*\/>/g,
-    (m, rid) => {
-      const key = `img_${++idx}`;
-      schedule(rid, key);
-      return `[!img:$${key}$]`;
-    }
-  );
-
-  await Promise.all(jobs);
-  return { outXml: docXml, imgMap };
-}
-
-/* ================= Text (GIỮ token + underline) ================= */
-
-function wordXmlToTextKeepTokens(docXml) {
-  let x = docXml
-    .replace(/<w:tab\s*\/>/g, "\t")
-    .replace(/<w:br\s*\/>/g, "\n")
-    .replace(/<\/w:p>/g, "\n");
-
-  // Protect tokens BEFORE stripping tags
-  x = x.replace(/\[!m:\$\$?(.*?)\$\$?\]/g, "___MATH_TOKEN___$1___END___");
-  x = x.replace(/\[!img:\$\$?(.*?)\$\$?\]/g, "___IMG_TOKEN___$1___END___");
-
-  // Convert each run while preserving underline
-  x = x.replace(/<w:r\b[\s\S]*?<\/w:r>/g, (run) => {
-    const hasU =
-      /<w:u\b[^>]*\/>/.test(run) &&
-      !/<w:u\b[^>]*w:val="none"[^>]*\/>/.test(run);
-
-    let inner = run.replace(/<w:rPr\b[\s\S]*?<\/w:rPr>/g, "");
-    inner = inner.replace(/<w:t\b[^>]*>([\s\S]*?)<\/w:t>/g, (_, t) => t ?? "");
-    inner = inner.replace(
-      /<w:instrText\b[^>]*>([\s\S]*?)<\/w:instrText>/g,
-      (_, t) => t ?? ""
-    );
-
-    inner = inner.replace(/<[^>]+>/g, "");
-    if (!inner) return "";
-    return hasU ? `<u>${inner}</u>` : inner;
-  });
-
-  // Remove remaining tags outside runs, but keep <u>
-  x = x.replace(/<(?!\/?u\b)[^>]+>/g, "");
-
-  // Restore tokens stable form
-  x = x
-    .replace(/___MATH_TOKEN___(.*?)___END___/g, "[!m:$$$1$$]")
-    .replace(/___IMG_TOKEN___(.*?)___END___/g, "[!img:$$$1$$]");
-
-  x = decodeXmlEntities(x)
-    .replace(/\r/g, "")
-    .replace(/[ \t]+\n/g, "\n")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-
-  return x;
-}
-
-/* ================= SECTION TITLES (PHẦN ...) ================= */
-
-function extractSectionTitles(rawText) {
-  const text = String(rawText || "").replace(/\r/g, "");
-
-  // anchors "Câu X."
-  const qRe = /(^|\n)\s*Câu\s+(\d+)\./gi;
-  const qAnchors = [];
-  let qm;
-  while ((qm = qRe.exec(text)) !== null) {
-    qAnchors.push({
-      idx: qm.index + (qm[1] ? qm[1].length : 0),
-      no: Number(qm[2]),
-    });
-  }
-
-  // anchors "PHẦN ..."
-  const sRe =
-    /(^|\n)\s*(?:[-•–]\s*)?PHẦN\s+([0-9]+|[IVXLCDM]+)\s*[\.\:\-]?\s*([^\n]*)/gi;
-
-  const sections = [];
-  let sm;
-  while ((sm = sRe.exec(text)) !== null) {
-    const startChar = sm.index + (sm[1] ? sm[1].length : 0);
-
-    let titleLine = `PHẦN ${sm[2]}. ${sm[3] || ""}`.trim();
-    const cutIdx = titleLine.search(/(?=\bCâu\s+\d+\.)/i);
-    if (cutIdx > 0) titleLine = titleLine.slice(0, cutIdx).trim();
-
-    sections.push({
-      title: titleLine,
-      order: sections.length + 1,
-      startChar,
-      endChar: null,
-      firstQuestionNo: null,
-      questionCount: 0,
-      questionIndexStart: null,
-      questionIndexEnd: null,
-    });
-  }
-
-  for (let i = 0; i < sections.length; i++) {
-    sections[i].endChar =
-      i + 1 < sections.length ? sections[i + 1].startChar : text.length;
-  }
-
-  for (const sec of sections) {
-    const startIdx = qAnchors.findIndex(
-      (q) => q.idx >= sec.startChar && q.idx < sec.endChar
-    );
-    if (startIdx === -1) continue;
-
-    let endIdx = qAnchors.length;
-    for (let k = startIdx; k < qAnchors.length; k++) {
-      if (qAnchors[k].idx >= sec.endChar) {
-        endIdx = k;
-        break;
+      }
+    } else {
+      const runText = collectTextFromRun(rNode);
+      if (runText) {
+        const esc = escapeTextToHtml(runText);
+        html += under ? `<u>${esc}</u>` : esc;
       }
     }
 
-    sec.questionIndexStart = startIdx;
-    sec.questionIndexEnd = endIdx;
-    sec.questionCount = endIdx - startIdx;
-    sec.firstQuestionNo = qAnchors[startIdx]?.no ?? null;
+    const runImgRids = Array.from(new Set(findImageEmbedRidsDeep(rNode, [])));
+    const processedInLoop = new Set();
+
+    if (Array.isArray(rNode)) {
+      for (const child of rNode) {
+        if (child["w:drawing"] || child["w:pict"] || child["v:shape"] || child["w:object"]) {
+          const childRids = findImageEmbedRidsDeep(child, []);
+          childRids.forEach(rid => processedInLoop.add(rid));
+        }
+      }
+    }
+
+    for (const rid of runImgRids) {
+      if (processedInLoop.has(rid)) continue;
+      const dataUri = imageByRid[rid];
+      if (dataUri) {
+        debug.imagesInjected++;
+        html += `<img src="${dataUri}" style="max-width:100%;height:auto;vertical-align:middle;" />`;
+      }
+    }
+
+    if (runHasOleLike(rNode)) {
+      debug.seenOleRuns++;
+      const rids = Array.from(new Set(findAllRidsDeep(rNode, [])));
+
+      const processedMathRids = new Set();
+      if (Array.isArray(rNode)) {
+        for (const child of rNode) {
+          if (child["w:object"] || child["o:OLEObject"]) {
+            const childRids = findAllRidsDeep(child, []);
+            childRids.forEach(rid => {
+              if (latexByRid[rid]) processedMathRids.add(rid);
+            });
+          }
+        }
+      }
+
+      for (const rid of rids) {
+        if (processedMathRids.has(rid)) continue;
+        const latex = latexByRid[rid];
+        if (latex) {
+          debug.seenOle++;
+          if (debug.sampleRids.length < 12) debug.sampleRids.push(rid);
+          const mathSpan = `<span class="math">\\(${latex}\\)</span>`;
+          html = appendMathWithOneSpace(html, mathSpan);
+          debug.oleInjected++;
+        } else {
+          debug.ignoredRids++;
+        }
+      }
+    }
   }
 
-  return sections;
+  return html;
 }
 
-/* ================== EXAM PARSER (GIỮ NGUYÊN) ================== */
+function renderTable(tblNode, ctx) {
+  const rows = kids(tblNode, "w:tr");
+  let html = `<table border="1" style="border-collapse:collapse;width:auto;max-width:100%;">`;
 
-function stripTagsToPlain(s) {
-  return String(s || "")
-    .replace(/<u[^>]*>/gi, "")
-    .replace(/<\/u>/gi, "")
+  for (const trWrap of rows) {
+    const trNode = trWrap["w:tr"];
+    html += "<tr>";
+
+    const cells = kids(trNode, "w:tc");
+    for (const tcWrap of cells) {
+      const tcNode = tcWrap["w:tc"];
+      html += `<td style="padding:6px;vertical-align:top;">`;
+
+      const paras = kids(tcNode, "w:p");
+      for (const pWrap of paras) {
+        const pHtml = renderParagraph(pWrap["w:p"], ctx);
+        if (pHtml) html += pHtml;
+        html += "<br/>";
+      }
+
+      html += "</td>";
+    }
+
+    html += "</tr>";
+  }
+
+  html += "</table><br/>";
+  return html;
+}
+
+function buildInlineHtml(documentXml, ctx) {
+  const parser = new XMLParser({ ignoreAttributes: false, preserveOrder: true });
+  const tree = parser.parse(documentXml);
+  const doc = kids(tree, "w:document")[0]?.["w:document"];
+  const body = kids(doc, "w:body")[0]?.["w:body"];
+  const bodyChildren = Array.isArray(body) ? body : [];
+
+  let html = "";
+  for (const child of bodyChildren) {
+    if (child["w:p"]) {
+      const pHtml = renderParagraph(child["w:p"], ctx);
+      if (pHtml) html += pHtml;
+      html += "<br/>";
+    } else if (child["w:tbl"]) {
+      html += renderTable(child["w:tbl"], ctx);
+    }
+  }
+  return html;
+}
+
+/* ================== FORMAT LAYOUT + PARSE EXAM (from inlineHtml) ================== */
+function splitByMath(html) {
+  const out = [];
+  const re = /\\\([\s\S]*?\\\)/g;
+  let last = 0, m;
+  while ((m = re.exec(html)) !== null) {
+    if (m.index > last) out.push({ math: false, text: html.slice(last, m.index) });
+    out.push({ math: true, text: m[0] });
+    last = m.index + m[0].length;
+  }
+  if (last < html.length) out.push({ math: false, text: html.slice(last) });
+  return out;
+}
+
+function normalizeGluedChoiceMarkers(s) {
+  s = String(s || "");
+  s = s.replace(/([^<\s>])([ABCD])\./g, "$1 $2.");
+  s = s.replace(/([^<\s>])([a-d])\)/gi, "$1 $2)");
+  s = s.replace(/([^<\s>])(<u[^>]*>\s*[ABCD]\s*<\/u>\s*\.)/gi, "$1 $2");
+  s = s.replace(/([^<\s>])(<u[^>]*>\s*[a-d]\s*<\/u>\s*\))/gi, "$1 $2");
+  return s;
+}
+
+function formatAbcdOutsideHeaders(text) {
+  const headerRegex = /(<div class="section-header">[\s\S]*?<\/div>)/g;
+  const segments = text.split(headerRegex);
+
+  return segments.map(seg => {
+    if (seg.startsWith('<div class="section-header">')) {
+      return seg;
+    }
+    let s = seg;
+    s = s
+      .replace(/(^|<br\/>\s*<br\/>|\n)\s*([a-d])\)/gi, "$1&emsp;$2)")
+      .replace(/([^<\n])\s*([a-d])\)/gi, "$1<br/>&emsp;$2)");
+    s = s
+      .replace(/(^|<br\/>\s*<br\/>|\n)\s*(<u[^>]*>\s*[a-d]\s*\)\s*<\/u>)/gi, "$1&emsp;$2")
+      .replace(/([^<\n])\s*(<u[^>]*>\s*[a-d]\s*\)\s*<\/u>)/gi, "$1<br/>&emsp;$2");
+    s = s
+      .replace(/(^|<br\/>\s*<br\/>|\n)\s*(<u[^>]*>\s*[a-d]\s*<\/u>\s*\))/gi, "$1&emsp;$2")
+      .replace(/([^<\n])\s*(<u[^>]*>\s*[a-d]\s*<\/u>\s*\))/gi, "$1<br/>&emsp;$2");
+    return s;
+  }).join('');
+}
+
+function formatExamLayout(html) {
+  let result = html;
+  result = result.replace(/\s+/g, " ");
+  result = result.replace(/PHẦN(\d)/gi, "PHẦN $1");
+  result = result.replace(
+    /(^|<br\/>)\s*(PHẦN\s+\d+\.(?:(?!<br\/>\s*Câu\s+\d).)*)/g,
+    '$1<br/><div class="section-header"><strong>$2</strong></div>'
+  );
+  const parts = splitByMath(result);
+
+  for (const p of parts) {
+    if (p.math) continue;
+    p.text = normalizeGluedChoiceMarkers(p.text);
+    p.text = p.text
+      .replace(/(^|<br\/>\s*<br\/>|\n)\s*([ABCD])\./g, "$1&emsp;$2.")
+      .replace(/([^<\n])\s*([ABCD])\./g, "$1<br/>&emsp;$2.");
+
+    p.text = p.text
+      .replace(/(^|<br\/>\s*<br\/>|\n)\s*(<u[^>]*>\s*[ABCD]\s*<\/u>\s*\.)/gi, "$1&emsp;$2")
+      .replace(/([^<\n])\s*(<u[^>]*>\s*[ABCD]\s*<\/u>\s*\.)/gi, "$1<br/>&emsp;$2");
+
+    p.text = formatAbcdOutsideHeaders(p.text);
+
+    p.text = p.text.replace(/(Câu)\s*(\d+)\s*\./g, "$1 $2.");
+    p.text = p.text.replace(/(<br\/>\s*){3,}/g, "<br/><br/>");
+  }
+
+  return parts.map((x) => x.text).join("");
+}
+
+function stripAllTagsToPlain(html) {
+  return String(html || "")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/&emsp;/g, " ")
+    .replace(/<[^>]*>/g, " ")
     .replace(/\s+/g, " ")
     .trim();
 }
 
-function detectHasMCQ(plain) {
-  const marks = plain.match(/\b[ABCD]\./g) || [];
-  return new Set(marks).size >= 2;
-}
-
-function detectHasTF4(plain) {
-  const marks = plain.match(/\b[a-d]\)/gi) || [];
-  return new Set(marks.map((x) => x.toLowerCase())).size >= 2;
-}
-
-function extractUnderlinedKeys(blockText) {
+function extractUnderlinedKeys(blockHtml) {
   const keys = { mcq: null, tf: [] };
-  const s = String(blockText || "");
-
+  const s = String(blockHtml || "");
   let m =
     s.match(/<u[^>]*>\s*([A-D])\s*<\/u>\s*\./i) ||
     s.match(/<u[^>]*>\s*([A-D])\.\s*<\/u>/i);
   if (m) keys.mcq = m[1].toUpperCase();
-
   let mm;
   const reTF1 = /<u[^>]*>\s*([a-d])\s*\)\s*<\/u>/gi;
   while ((mm = reTF1.exec(s)) !== null) keys.tf.push(mm[1].toLowerCase());
-
   const reTF2 = /<u[^>]*>\s*([a-d])\s*<\/u>\s*\)/gi;
   while ((mm = reTF2.exec(s)) !== null) keys.tf.push(mm[1].toLowerCase());
-
   keys.tf = [...new Set(keys.tf)];
   return keys;
 }
 
-function normalizeUnderlinedMarkersForSplit(s) {
-  let x = String(s || "");
-  x = x.replace(/<u[^>]*>\s*([A-D])\s*<\/u>\s*\./gi, "$1.");
-  x = x.replace(/<u[^>]*>\s*([A-D])\.\s*<\/u>/gi, "$1.");
-  x = x.replace(/<u[^>]*>\s*([a-d])\s*\)\s*<\/u>/gi, "$1)");
-  x = x.replace(/<u[^>]*>\s*([a-d])\s*<\/u>\s*\)/gi, "$1)");
-  return x;
+function normalizeUnderlinedMarkersForSplit(html) {
+  let s = String(html || "");
+  s = s.replace(/<u[^>]*>\s*([A-D])\s*<\/u>\s*\./gi, "$1.");
+  s = s.replace(/<u[^>]*>\s*([A-D])\.\s*<\/u>/gi, "$1.");
+  s = s.replace(/<u[^>]*>\s*([a-d])\s*\)\s*<\/u>/gi, "$1)");
+  s = s.replace(/<u[^>]*>\s*([a-d])\s*<\/u>\s*\)/gi, "$1)");
+  return s;
 }
 
-function findSolutionMarkerIndex(text, fromIndex = 0) {
-  const s = String(text || "");
-  const re = /(Lời\s*giải|Giải\s*chi\s*tiết|Hướng\s*dẫn\s*giải)/i;
+function removeUnsupportedImages(html) {
+  let s = String(html || "");
+  s = s.replace(/<img[^>]*src\s*=\s*["']\s*["'][^>]*>/gi, "");
+  s = s.replace(/<img(?![^>]*src\s*=)[^>]*>/gi, "");
+  s = s.replace(/<img[^>]*data:application\/octet-stream[^>]*>/gi, "");
+  return s;
+}
+
+function splitChoicesHtmlABCD(blockHtml) {
+  let s = normalizeUnderlinedMarkersForSplit(blockHtml);
+  s = s.replace(/&emsp;/g, " ");
+  s = normalizeGluedChoiceMarkers(s);
+  s = s.replace(/<br\/>/g, " <br/>");
+
+  const re = /(^|[\s>.:;,<\)\]\}！？\?])([ABCD])\./g;
+
+  const hits = [];
+  let m;
+  while ((m = re.exec(s)) !== null) hits.push({ idx: m.index + m[1].length, key: m[2] });
+  if (hits.length < 2) return null;
+
+  const lastStart = hits[hits.length - 1].idx;
+  const solIdx = findSolutionMarkerIndex(s, lastStart);
+  const endAll = solIdx >= 0 ? solIdx : s.length;
+
+  const out = {
+    _stem: s.slice(0, hits[0].idx).trim(),
+    _tail: solIdx >= 0 ? s.slice(solIdx).trim() : "",
+  };
+
+  for (let i = 0; i < hits.length; i++) {
+    const key = hits[i].key;
+    const start = hits[i].idx;
+    const end = i + 1 < hits.length ? hits[i + 1].idx : endAll;
+    let seg = s.slice(start, end).trim();
+    seg = seg.replace(/^([ABCD])\.\s*/i, "");
+    out[key] = removeUnsupportedImages(seg.trim());
+  }
+  return out;
+}
+
+function splitStatementsHtmlabcd(blockHtml) {
+  let s = normalizeUnderlinedMarkersForSplit(blockHtml);
+  s = s.replace(/&emsp;/g, " ");
+  s = normalizeGluedChoiceMarkers(s);
+  s = s.replace(/<br\/>/g, " <br/>");
+
+  const earlysolIdx = findSolutionMarkerIndex(s, 0);
+  let workingHtml = s;
+  let tailHtml = "";
+
+  if (earlysolIdx >= 0) {
+    workingHtml = s.slice(0, earlysolIdx);
+    tailHtml = s.slice(earlysolIdx).trim();
+  }
+
+  const re = /(^|[\s>.:;,<\)\]\}！？\?])([a-d])\)/gi;
+
+  const hits = [];
+  let m;
+  while ((m = re.exec(workingHtml)) !== null) {
+    hits.push({ idx: m.index + m[1].length, key: m[2].toLowerCase() });
+  }
+  if (hits.length < 2) return null;
+
+  const out = {
+    _stem: workingHtml.slice(0, hits[0].idx).trim(),
+    _tail: tailHtml,
+  };
+
+  for (let i = 0; i < hits.length; i++) {
+    const key = hits[i].key;
+    const start = hits[i].idx;
+    const end = i + 1 < hits.length ? hits[i + 1].idx : workingHtml.length;
+    let seg = workingHtml.slice(start, end).trim();
+    seg = seg.replace(/^([a-d])\)\s*/i, "");
+    out[key] = removeUnsupportedImages(seg.trim());
+  }
+  return out;
+}
+
+function findSolutionMarkerIndex(html, fromIndex = 0) {
+  const s = String(html || "");
+  const re = /(Lời(?:\s*<[^>]*>)*\s*giải|Giải(?:\s*<[^>]*>)*\s*chi\s*tiết|Hướng(?:\s*<[^>]*>)*\s*dẫn(?:\s*<[^>]*>)*\s*giải)/i;
   const sub = s.slice(fromIndex);
   const m = re.exec(sub);
   if (!m) return -1;
   return fromIndex + m.index;
 }
 
-function splitSolutionSections(tailText) {
-  let s = String(tailText || "").trim();
-  if (!s) return { solution: "", detail: "" };
-
-  const reCT = /(Giải\s*chi\s*tiết)/i;
+function splitSolutionSections(tailHtml) {
+  let s = String(tailHtml || "").trim();
+  if (!s) return { solutionHtml: "", detailHtml: "" };
+  const reCT = /(Giải(?:\s*<[^>]*>)*\s*chi\s*tiết)/i;
   const matchCT = reCT.exec(s);
   if (matchCT) {
     const idxCT = matchCT.index;
     return {
-      solution: s.slice(0, idxCT).trim(),
-      detail: s.slice(idxCT).trim(),
+      solutionHtml: s.slice(0, idxCT).trim(),
+      detailHtml: s.slice(idxCT).trim(),
     };
   }
-  return { solution: s, detail: "" };
+  return { solutionHtml: s, detailHtml: "" };
 }
 
-function cleanStemFromQuestionNo(s) {
-  return String(s || "").replace(/^Câu\s+\d+\.?\s*/i, "").trim();
+function cleanStem(html) {
+  if (!html) return html;
+  return String(html).replace(/^Câu\s+\d+\.?\s*/i, '').trim();
 }
 
-function splitChoicesTextABCD(blockText) {
-  let s = normalizeUnderlinedMarkersForSplit(blockText);
-  s = s.replace(/\r/g, "");
-
-  const solIdx = findSolutionMarkerIndex(s, 0);
-  const main = solIdx >= 0 ? s.slice(0, solIdx) : s;
-  const tail = solIdx >= 0 ? s.slice(solIdx) : "";
-
-  const re = /(^|\n)\s*(\*?)([A-D])\.\s*/g;
-
+function parseExamFromInlineHtml(inlineHtml) {
+  const re = /(^|<br\/>\s*)\s*(?:<[^>]*>\s*)*Câu\s+(\d+)\./gi;
   const hits = [];
   let m;
-  while ((m = re.exec(main)) !== null) {
-    hits.push({ idx: m.index + m[1].length, star: m[2] === "*", key: m[3] });
+  while ((m = re.exec(inlineHtml)) !== null) {
+    const startAt = m.index + (m[1] ? m[1].length : 0);
+    hits.push({ qno: Number(m[2]), pos: startAt });
   }
-  if (hits.length < 2) return null;
+  if (!hits.length) return null;
 
-  const out = {
-    stem: main.slice(0, hits[0].idx).trim(),
-    choices: { A: "", B: "", C: "", D: "" },
-    starredCorrect: null,
-    tail,
-  };
+  const sectionRe = /<div class="section-header"><strong>([\s\S]*?)<\/strong><\/div>/gi;
+  const sections = [];
+  let sectionMatch;
+  while ((sectionMatch = sectionRe.exec(inlineHtml)) !== null) {
+    sections.push({
+      pos: sectionMatch.index,
+      html: sectionMatch[0],
+      title: sectionMatch[1].trim()
+    });
+  }
 
+  const rawBlocks = [];
   for (let i = 0; i < hits.length; i++) {
-    const key = hits[i].key;
-    const start = hits[i].idx;
-    const end = i + 1 < hits.length ? hits[i + 1].idx : main.length;
-    let seg = main.slice(start, end).trim();
-    seg = seg.replace(/^(\*?)([A-D])\.\s*/i, "");
-    out.choices[key] = seg.trim();
-    if (hits[i].star) out.starredCorrect = key;
+    const start = hits[i].pos;
+    let end = i + 1 < hits.length ? hits[i + 1].pos : inlineHtml.length;
+    for (const sec of sections) {
+      if (sec.pos > start && sec.pos < end) {
+        end = sec.pos;
+        break;
+      }
+    }
+    rawBlocks.push({ qno: hits[i].qno, pos: hits[i].pos, html: inlineHtml.slice(start, end) });
   }
-  return out;
-}
 
-function splitStatementsTextabcd(blockText) {
-  let s = normalizeUnderlinedMarkersForSplit(blockText);
-  s = s.replace(/\r/g, "");
-
-  const solIdx = findSolutionMarkerIndex(s, 0);
-  const main = solIdx >= 0 ? s.slice(0, solIdx) : s;
-  const tail = solIdx >= 0 ? s.slice(solIdx) : "";
-
-  const re = /(^|\n)\s*([a-d])\)\s*/gi;
-  const hits = [];
-  let m;
-  while ((m = re.exec(main)) !== null) {
-    hits.push({ idx: m.index + m[1].length, key: m[2].toLowerCase() });
+  const blocks = [];
+  for (const b of rawBlocks) {
+    const last = blocks[blocks.length - 1];
+    if (last && last.qno === b.qno) {
+      last.html += "<br/>" + b.html;
+    } else {
+      blocks.push({ ...b });
+    }
   }
-  if (hits.length < 2) return null;
 
-  const out = {
-    stem: main.slice(0, hits[0].idx).trim(),
-    statements: { a: "", b: "", c: "", d: "" },
-    tail,
-  };
+  const exam = { version: 8, questions: [], sections };
 
-  for (let i = 0; i < hits.length; i++) {
-    const key = hits[i].key;
-    const start = hits[i].idx;
-    const end = i + 1 < hits.length ? hits[i + 1].idx : main.length;
-    let seg = main.slice(start, end).trim();
-    seg = seg.replace(/^([a-d])\)\s*/i, "");
-    out.statements[key] = seg.trim();
+  function findSectionForQuestion(qPos) {
+    let currentSection = null;
+    for (const sec of sections) {
+      if (sec.pos < qPos) {
+        currentSection = sec;
+      } else {
+        break;
+      }
+    }
+    return currentSection;
   }
-  return out;
-}
 
-function parseExamFromText(text) {
-  const blocks = String(text || "").split(/(?=Câu\s+\d+\.)/);
-  const exam = { version: 10, questions: [] };
+  for (const b of blocks) {
+    const under = extractUnderlinedKeys(b.html);
+    const plain = stripAllTagsToPlain(b.html);
+    const section = findSectionForQuestion(b.pos);
 
-  for (const block of blocks) {
-    if (!/^Câu\s+\d+\./i.test(block)) continue;
-
-    const qnoMatch = block.match(/^Câu\s+(\d+)\./i);
-    const no = qnoMatch ? Number(qnoMatch[1]) : null;
-
-    const under = extractUnderlinedKeys(block);
-    const plain = stripTagsToPlain(block);
-
-    const isMCQ = detectHasMCQ(plain);
-    const isTF4 = !isMCQ && detectHasTF4(plain);
+    const isMCQ = /\b[ABCD]\./.test(plain) && (plain.match(/\b[ABCD]\./g) || []).length >= 2;
+    const isTF4 = !isMCQ && (plain.match(/\b[a-d]\)/gi) || []).length >= 2;
 
     if (isMCQ) {
-      const parts = splitChoicesTextABCD(block);
-      const tail = parts?.tail || "";
-      const solParts = splitSolutionSections(tail);
-
-      const answer = parts?.starredCorrect || under.mcq || null;
-
+      const parts = splitChoicesHtmlABCD(b.html);
+      const sol = splitSolutionSections(parts?._tail || "");
       exam.questions.push({
-        no,
+        no: b.qno,
         type: "mcq",
-        stem: cleanStemFromQuestionNo(parts?.stem || block),
-        choices: {
-          A: parts?.choices?.A || "",
-          B: parts?.choices?.B || "",
-          C: parts?.choices?.C || "",
-          D: parts?.choices?.D || "",
-        },
-        answer,
-        solution: solParts.solution || "",
-        detail: solParts.detail || "",
+        stemHtml: cleanStem(parts?._stem || b.html),
+        choicesHtml: { A: parts?.A || "", B: parts?.B || "", C: parts?.C || "", D: parts?.D || "" },
+        answer: under.mcq,
+        solutionHtml: sol.solutionHtml,
+        detailHtml: sol.detailHtml,
         _plain: plain,
+        section: section ? { title: section.title, html: section.html } : null
       });
       continue;
     }
 
     if (isTF4) {
-      const parts = splitStatementsTextabcd(block);
-      const tail = parts?.tail || "";
-      const solParts = splitSolutionSections(tail);
-
+      const parts = splitStatementsHtmlabcd(b.html);
+      const sol = splitSolutionSections(parts?._tail || "");
       const ans = { a: null, b: null, c: null, d: null };
       for (const k of ["a", "b", "c", "d"]) {
         if (under.tf.includes(k)) ans[k] = true;
       }
-
       exam.questions.push({
-        no,
+        no: b.qno,
         type: "tf4",
-        stem: cleanStemFromQuestionNo(parts?.stem || block),
-        statements: {
-          a: parts?.statements?.a || "",
-          b: parts?.statements?.b || "",
-          c: parts?.statements?.c || "",
-          d: parts?.statements?.d || "",
-        },
+        stemHtml: cleanStem(parts?._stem || b.html),
+        statements: { a: parts?.a || "", b: parts?.b || "", c: parts?.c || "", d: parts?.d || "" },
         answer: ans,
-        solution: solParts.solution || "",
-        detail: solParts.detail || "",
+        solutionHtml: sol.solutionHtml,
+        detailHtml: sol.detailHtml,
         _plain: plain,
+        section: section ? { title: section.title, html: section.html } : null
       });
       continue;
     }
 
-    const solIdx = findSolutionMarkerIndex(block, 0);
-    const stemPart = solIdx >= 0 ? block.slice(0, solIdx).trim() : block.trim();
-    const tailPart = solIdx >= 0 ? block.slice(solIdx).trim() : "";
-
-    const solParts = splitSolutionSections(tailPart);
+    const solIdx = findSolutionMarkerIndex(b.html, 0);
+    const stemPart = solIdx >= 0 ? b.html.slice(0, solIdx).trim() : b.html;
+    const tailPart = solIdx >= 0 ? b.html.slice(solIdx).trim() : "";
+    const sol = splitSolutionSections(tailPart);
 
     exam.questions.push({
-      no,
+      no: b.qno,
       type: "short",
-      stem: cleanStemFromQuestionNo(stemPart),
+      stemHtml: cleanStem(stemPart),
       boxes: 4,
-      solution: solParts.solution || tailPart || "",
-      detail: solParts.detail || "",
+      solutionHtml: sol.solutionHtml || tailPart,
+      detailHtml: sol.detailHtml || "",
       _plain: plain,
+      section: section ? { title: section.title, html: section.html } : null
     });
   }
 
   return exam;
 }
 
-function legacyQuestionsFromExam(exam) {
-  const out = [];
-  for (const q of exam.questions) {
-    if (q.type !== "mcq") continue;
-    out.push({
-      type: "multiple_choice",
-      content: q.stem,
-      choices: [
-        { label: "A", text: q.choices.A },
-        { label: "B", text: q.choices.B },
-        { label: "C", text: q.choices.C },
-        { label: "D", text: q.choices.D },
-      ],
-      correct: q.answer,
-      solution: [q.solution, q.detail].filter(Boolean).join("\n").trim(),
-    });
-  }
-  return out;
-}
-
-/* ================= helper: gán sectionOrder cho từng question ================= */
-
+/* ================== attachSectionOrder + buildOrderedBlocks ================== */
 function attachSectionOrderToQuestions(exam, sections) {
   if (!exam?.questions?.length || !Array.isArray(sections)) return;
-
   for (const q of exam.questions) {
     q.sectionOrder = null;
     q.sectionTitle = null;
   }
-
-  for (const sec of sections) {
-    if (
-      typeof sec.questionIndexStart !== "number" ||
-      typeof sec.questionIndexEnd !== "number"
-    ) {
-      continue;
+  for (let i = 0; i < sections.length; i++) {
+    const sec = sections[i];
+    if (!sec) continue;
+    // determine questionIndexStart/End by scanning exam.questions positions (we don't have raw positions here)
+    // We'll derive by matching section.title presence in question.section if present
+    for (let qi = 0; qi < exam.questions.length; qi++) {
+      const q = exam.questions[qi];
+      if (q.section && q.section.title === sec.title) {
+        // back-fill contiguous questions belonging to same section (approx)
+        q.sectionOrder = i + 1;
+        q.sectionTitle = sec.title;
+      }
     }
-    const a = Math.max(0, sec.questionIndexStart);
-    const b = Math.min(exam.questions.length, sec.questionIndexEnd);
-    for (let i = a; i < b; i++) {
-      exam.questions[i].sectionOrder = sec.order;
-      exam.questions[i].sectionTitle = sec.title;
+  }
+  // If some questions still null, set to 1
+  for (const q of exam.questions) {
+    if (!q.sectionOrder) {
+      q.sectionOrder = 1;
+      if (!q.sectionTitle) q.sectionTitle = "PHẦN 1";
     }
   }
 }
 
-/* ================= ✅ blocks trộn section + question đúng thứ tự ================= */
-
-function buildOrderedBlocks(exam) {
+function buildOrderedBlocksFromExam(exam) {
   const blocks = [];
   let lastSec = null;
-
   for (const q of exam?.questions || []) {
     const sec = q.sectionOrder || null;
     if (sec && sec !== lastSec) {
@@ -1549,79 +925,94 @@ function buildOrderedBlocks(exam) {
   return blocks;
 }
 
-/* ================= API ================= */
-
+/* ================== ROUTE: /upload (main) ================== */
 app.post("/upload", upload.single("file"), async (req, res) => {
   try {
     if (!req.file?.buffer) throw new Error("No file uploaded");
+    const zip = await openDocxZip(req.file.buffer);
 
-    const zip = await unzipper.Open.buffer(req.file.buffer);
+    const docBuf = await readZipEntry(zip, "word/document.xml");
+    const relBuf = await readZipEntry(zip, "word/_rels/document.xml.rels");
+    if (!docBuf || !relBuf) throw new Error("Missing document.xml or document.xml.rels");
 
-    const docEntry = zip.files.find((f) => f.path === "word/document.xml");
-    const relEntry = zip.files.find(
-      (f) => f.path === "word/_rels/document.xml.rels"
-    );
-    if (!docEntry || !relEntry)
-      throw new Error("Missing document.xml or document.xml.rels");
+    const { emb: embRelMap, media: mediaRelMap } = buildRelMaps(relBuf.toString("utf8"));
 
-    let docXml = (await docEntry.buffer()).toString("utf8");
-    const relsXml = (await relEntry.buffer()).toString("utf8");
-    const rels = parseRels(relsXml);
+    // 1) Convert embeddings (OLE) -> MathML -> LaTeX (parallel with limit)
+    const latexByRid = {};
+    const mathmlByRid = {};
+    const embEntries = Object.entries(embRelMap);
+    await Promise.all(embEntries.map(async ([rid, embPath]) => {
+      const f = (zip.files || []).find(x => x.path === embPath);
+      if (!f) return;
+      try {
+        const buf = await f.buffer();
+        const mml = await rubyConvertWithCache(buf, embPath);
+        if (!mml) return;
+        mathmlByRid[rid] = mml;
+        const latex = mathmlToLatexSafe(mml);
+        if (latex) latexByRid[rid] = latex;
+      } catch (e) {
+        // ignore per-item failures
+      }
+    }));
 
-    // 1) MathType -> LaTeX (and fallback images)
-    const images = {};
-    const debug = req.query.debug === "1" || req.query.debug === "true";
-    const forcePreviewWhenSqrtMissing = req.query.forcePreview === "1" || req.query.forcePreview === "true";
-    const mt = await tokenizeMathTypeOleFirst(docXml, rels, zip.files, images, { debug, forcePreviewWhenSqrtMissing });
-    docXml = mt.outXml;
-    const latexMap = mt.latexMap;
+    // 2) Convert media -> dataUris (handle EMF/WMF)
+    const imageByRid = {};
+    const mediaEntries = Object.entries(mediaRelMap);
+    await Promise.all(mediaEntries.map(async ([rid, mediaPath]) => {
+      const f = (zip.files || []).find(x => x.path === mediaPath);
+      if (!f) return;
+      try {
+        const buf = await f.buffer();
+        const ext = getExtFromPath(mediaPath);
+        if (ext === "emf" || ext === "wmf") {
+          const png = convertEmfWmfToPng(buf, ext);
+          if (png) {
+            imageByRid[rid] = `data:image/png;base64,${png.toString("base64")}`;
+            return;
+          }
+        }
+        imageByRid[rid] = `data:${mimeFromExt(mediaPath)};base64,${buf.toString("base64")}`;
+      } catch (e) {}
+    }));
 
-    // 2) normal images
-    const imgTok = await tokenizeImagesAfter(docXml, rels, zip.files);
-    docXml = imgTok.outXml;
-    Object.assign(images, imgTok.imgMap);
+    // 3) Build inlineHtml using preserve-order renderer
+    const debug = {
+      embeddings: Object.keys(embRelMap).length,
+      latexCount: Object.keys(latexByRid).length,
+      imagesCount: Object.keys(imageByRid).length,
+      imagesInjected: 0,
+      seenOleRuns: 0,
+      seenOle: 0,
+      oleInjected: 0,
+      ignoredRids: 0,
+      sampleRids: [],
+      mathmlByRidCount: Object.keys(mathmlByRid).length
+    };
+    const ctx = { latexByRid, imageByRid, debug };
 
-    // 3) text (giữ token + underline)
-    const text = wordXmlToTextKeepTokens(docXml);
+    let inlineHtml = buildInlineHtml(docBuf.toString("utf8"), ctx);
+    inlineHtml = formatExamLayout(inlineHtml);
+    inlineHtml = removeUnsupportedImages(inlineHtml);
 
-    // 4) parse exam output
-    const exam = parseExamFromText(text);
+    // 4) Parse exam from inlineHtml (preserve underline)
+    const exam = parseExamFromInlineHtml(inlineHtml) || { version: 8, questions: [], sections: [] };
 
-    // sections theo vị trí + index câu toàn cục
-    const sections = extractSectionTitles(text);
-    exam.sections = sections;
+    // 5) Attach section order to questions and build blocks (section + question sequence)
+    attachSectionOrderToQuestions(exam, exam.sections || []);
+    const blocks = buildOrderedBlocksFromExam(exam);
 
-    // gán sectionOrder/sectionTitle cho từng question
-    attachSectionOrderToQuestions(exam, sections);
-
-    // ✅ blocks đã trộn đúng thứ tự để frontend render chuẩn như Word
-    const blocks = buildOrderedBlocks(exam);
-
-    // legacy (để tương thích)
-    const questions = legacyQuestionsFromExam(exam);
-
+    // 6) Return response (compatible with original server)
     res.json({
       ok: true,
-      debugMath: mt.debugMath || [],
       total: exam.questions.length,
-      sections,
+      sections: exam.sections || [],
       blocks,
       exam,
-      questions,
-      latex: latexMap,
-      images,
-      rawText: text,
-      debug: {
-        latexCount: Object.keys(latexMap).length,
-        imagesCount: Object.keys(images).length,
-        mathConcurrency: Math.max(1, Number(process.env.MATH_CONCURRENCY || 3)),
-        exam: {
-          questions: exam.questions.length,
-          mcq: exam.questions.filter((x) => x.type === "mcq").length,
-          tf4: exam.questions.filter((x) => x.type === "tf4").length,
-          short: exam.questions.filter((x) => x.type === "short").length,
-        },
-      },
+      latex: latexByRid,
+      images: imageByRid,
+      rawInlineHtml: inlineHtml,
+      debug,
     });
   } catch (err) {
     console.error(err);
@@ -1630,15 +1021,6 @@ app.post("/upload", upload.single("file"), async (req, res) => {
 });
 
 app.get("/ping", (_, res) => res.send("ok"));
-
-app.get("/debug-inkscape", (_, res) => {
-  try {
-    const v = execFileSync("inkscape", ["--version"]).toString();
-    res.type("text/plain").send(v);
-  } catch {
-    res.status(500).type("text/plain").send("NO INKSCAPE");
-  }
-});
-
+app.get("/health", (_, res) => res.json({ ok: true, node: process.version }));
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("🚀 Server running on", PORT));
