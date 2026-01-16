@@ -468,7 +468,7 @@ function mathmlToLatexSafe(mml) {
  *   latexMap[key] = "..."
  *   (optional) images["fallback_key"] = png dataURL if latex fails
  */
-async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
+async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images, opts = {}) {
   let idx = 0;
   const found = {}; // key -> { oleTarget, previewRid }
 
@@ -492,21 +492,40 @@ async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
   });
 
   const latexMap = {};
+  const debugMath = [];
+
+  const wantDebug = !!opts.debug;
 
   await Promise.all(
     Object.entries(found).map(async ([key, info]) => {
       const oleFull = normalizeTargetToWordPath(info.oleTarget);
       const oleBuf = await getZipEntryBuffer(zipFiles, oleFull);
 
-      // 1) try scan MathML inside OLE
       let mml = "";
-      if (oleBuf) mml = extractMathMLFromOleScan(oleBuf) || "";
+      let source = "";
+      let scanFound = false;
+      let rubyOk = false;
+      let rubyErr = "";
+
+      // 1) try scan MathML inside OLE
+      if (oleBuf) {
+        mml = extractMathMLFromOleScan(oleBuf) || "";
+        if (mml) {
+          source = "scan";
+          scanFound = true;
+        }
+      }
 
       // 2) fallback ruby convert (MTEF inside OLE)
       if (!mml && oleBuf) {
         try {
           mml = await rubyOleToMathML(oleBuf);
-        } catch {
+          if (mml) {
+            source = "ruby";
+            rubyOk = true;
+          }
+        } catch (e) {
+          rubyErr = e?.message || String(e);
           mml = "";
         }
       }
@@ -515,39 +534,73 @@ async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
       const latex = mml ? mathmlToLatexSafe(mml) : "";
       if (latex) {
         latexMap[key] = latex;
-        return;
+      } else {
+        latexMap[key] = "";
       }
 
-      // 4) If no latex, fallback to preview image (convert emf/wmf->png)
-      if (info.previewRid) {
-        const t = rels.get(info.previewRid);
-        if (t) {
-          const imgFull = normalizeTargetToWordPath(t);
-          const imgBuf = await getZipEntryBuffer(zipFiles, imgFull);
-          if (imgBuf) {
-            const mime = guessMimeFromFilename(imgFull);
-            if (mime === "image/emf" || mime === "image/wmf") {
-              try {
-                const pngBuf = await maybeConvertEmfWmfToPng(imgBuf, imgFull);
-                if (pngBuf) {
-                  images[`fallback_${key}`] =
-                    `data:image/png;base64,${pngBuf.toString("base64")}`;
-                  latexMap[key] = "";
-                  return;
-                }
-              } catch {}
+      // 4) fallback preview image if latex empty OR (debug mode and latex likely missing sqrt while mml has sqrt)
+      let usedFallbackImage = false;
+
+      const mmlNorm = mml ? preprocessMathMLForSqrt(normalizeMtable(ensureMathMLNamespace(stripMathMLTagPrefixes(mml)))) : "";
+      const mmlHasSqrt = !!mmlNorm && (SQRT_MATHML_RE.test(mmlNorm) || /<msqrt\b/i.test(mmlNorm) || /<mroot\b/i.test(mmlNorm));
+      const latexHasSqrt = /\\sqrt\b|\\root\b/.test(latex || "");
+
+      // If MathML clearly has sqrt but LaTeX doesn't, we keep latexMap as-is,
+      // but for display reliability you can choose to fallback to image instead.
+      const forcePreviewWhenSqrtMissing = !!opts.forcePreviewWhenSqrtMissing;
+
+      if ((forcePreviewWhenSqrtMissing && mmlHasSqrt && !latexHasSqrt) || (!latex && info.previewRid)) {
+        if (info.previewRid) {
+          const t = rels.get(info.previewRid);
+          if (t) {
+            const imgFull = normalizeTargetToWordPath(t);
+            const imgBuf = await getZipEntryBuffer(zipFiles, imgFull);
+            if (imgBuf) {
+              const mime = guessMimeFromFilename(imgFull);
+              if (mime === "image/emf" || mime === "image/wmf") {
+                try {
+                  const pngBuf = await maybeConvertEmfWmfToPng(imgBuf, imgFull);
+                  if (pngBuf) {
+                    images[`fallback_${key}`] = `data:image/png;base64,${pngBuf.toString("base64")}`;
+                    usedFallbackImage = true;
+                  }
+                } catch {}
+              }
+              if (!usedFallbackImage) {
+                images[`fallback_${key}`] = `data:${mime};base64,${imgBuf.toString("base64")}`;
+                usedFallbackImage = true;
+              }
             }
-            images[`fallback_${key}`] =
-              `data:${mime};base64,${imgBuf.toString("base64")}`;
           }
         }
       }
 
-      latexMap[key] = "";
+      if (wantDebug) {
+        debugMath.push({
+          key,
+          olePath: oleFull,
+          source,                 // "scan" | "ruby" | ""
+          scanFound,
+          rubyOk,
+          rubyErr: rubyErr ? rubyErr.slice(0, 500) : "",
+          mmlLength: (mml || "").length,
+          mmlHasSqrt,
+          latexLength: (latex || "").length,
+          latexHasSqrt,
+          usedFallbackImage,
+          previewRid: info.previewRid || null,
+          // keep only small snippets to avoid huge response
+          mmlHead: (mml || "").slice(0, 600),
+          latex: (latex || "").slice(0, 600),
+        });
+      }
     })
   );
 
-  return { outXml: docXml, latexMap };
+  // sort for stable output
+  debugMath.sort((a, b) => a.key.localeCompare(b.key));
+
+  return { outXml: docXml, latexMap, debugMath };
 }
 
 /**
@@ -708,7 +761,10 @@ app.post("/upload", upload.single("file"), async (req, res) => {
 
     // 1) MathType -> LaTeX (and fallback images)
     const images = {};
-    const mt = await tokenizeMathTypeOleFirst(docXml, rels, zip.files, images);
+    const debug = req.query.debug === "1" || req.query.debug === "true";
+    // If you want absolute correctness for sqrt display, turn this on:
+    const forcePreviewWhenSqrtMissing = req.query.forcePreview === "1" || req.query.forcePreview === "true";
+    const mt = await tokenizeMathTypeOleFirst(docXml, rels, zip.files, images, { debug, forcePreviewWhenSqrtMissing });
     docXml = mt.outXml;
     const latexMap = mt.latexMap;
 
@@ -730,6 +786,7 @@ app.post("/upload", upload.single("file"), async (req, res) => {
       latex: latexMap,
       images,
       rawText: text,
+      debugMath: mt.debugMath || [],
       debug: {
         latexCount: Object.keys(latexMap).length,
         imagesCount: Object.keys(images).length,
