@@ -1,9 +1,6 @@
 # Node.js + Ruby + Inkscape for MathType conversion
 FROM node:20-bookworm-slim
 
-WORKDIR /app
-ENV NODE_ENV=production
-
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ruby \
@@ -16,23 +13,29 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Ruby gem for MathType → MathML
-RUN gem install mathtype_to_mathml -N
+RUN gem install pry --no-document \
+ && gem install mathtype_to_mathml --no-document
+
+WORKDIR /app
 
 # Copy package files first (for cache)
 COPY package.json package-lock.json* ./
 
-# Install Node dependencies (prefer ci if lock exists)
-RUN if [ -f package-lock.json ]; then npm ci --omit=dev; else npm install --production; fi
+# Install Node dependencies
+RUN npm install --production
 
 # Copy application source
-COPY server.js mt2mml.rb ./
+COPY server.js mt2mml.rb mt2mml_v2.rb ./
 
-# Railway will inject PORT; server already uses process.env.PORT || 3000
-EXPOSE 3000
+# Environment
+ENV NODE_ENV=production
+ENV PORT=8000
 
-# Healthcheck -> use /ping (your server has it)
+EXPOSE 8000
+
+# Health check (optional but OK)
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-  CMD curl -fsS http://localhost:${PORT:-3000}/ping || exit 1
+    CMD curl -f http://localhost:${PORT}/health || exit 1
 
 # Start server
 CMD ["node", "server.js"]
