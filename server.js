@@ -4,10 +4,6 @@
 // - Server trả thêm `blocks` đã trộn (section + question) đúng thứ tự để frontend render chuẩn.
 // - ✅ NEW: Giữ được bảng <w:tbl> và nội dung trong bảng (kể cả underline + token math/img)
 //
-// ✅ FIX ẢNH BỊ THIẾU (Câu 7, Câu 11):
-// - Bắt thêm <a:blip ...> (không tự đóng) ngoài <a:blip .../>
-// - Bắt thêm cả r:link (một số doc dùng link thay vì embed)
-//
 // Chạy: node server.js
 // Yêu cầu: inkscape (convert emf/wmf), ruby + mt2mml.rb (fallback MathType)
 // npm i express multer unzipper cors mathml-to-latex
@@ -126,20 +122,44 @@ async function maybeConvertEmfWmfToPng(buf, filename) {
 
 /* ================= MathType OLE -> MathML -> LaTeX ================= */
 
+// ✅ FIX: bắt cả <math> và <m:math>
 function extractMathMLFromOleScan(buf) {
-  const utf8 = buf.toString("utf8");
-  let i = utf8.indexOf("<math");
-  if (i !== -1) {
-    let j = utf8.indexOf("</math>", i);
-    if (j !== -1) return utf8.slice(i, j + 7);
-  }
+  const tryExtract = (s) => {
+    if (!s) return null;
 
-  const u16 = buf.toString("utf16le");
-  i = u16.indexOf("<math");
-  if (i !== -1) {
-    let j = u16.indexOf("</math>", i);
-    if (j !== -1) return u16.slice(i, j + 7);
-  }
+    // bắt cả <math ...> và <m:math ...> (không phân biệt hoa thường)
+    const idxMath = s.search(/<math\b/i);
+    const idxMMath = s.search(/<m:math\b/i);
+
+    let i = -1;
+    let close = "";
+
+    if (idxMath !== -1 && (idxMMath === -1 || idxMath < idxMMath)) {
+      i = idxMath;
+      close = "</math>";
+    } else if (idxMMath !== -1) {
+      i = idxMMath;
+      close = "</m:math>";
+    } else {
+      return null;
+    }
+
+    const lower = s.toLowerCase();
+    const j = lower.indexOf(close, i);
+    if (j !== -1) return s.slice(i, j + close.length);
+
+    // fallback: open <m:math> nhưng close </math> (hiếm)
+    const j2 = lower.indexOf("</math>", i);
+    if (j2 !== -1) return s.slice(i, j2 + 7);
+
+    return null;
+  };
+
+  let out = tryExtract(buf.toString("utf8"));
+  if (out) return out;
+
+  out = tryExtract(buf.toString("utf16le"));
+  if (out) return out;
 
   return null;
 }
@@ -163,6 +183,76 @@ function rubyOleToMathML(oleBuf) {
       }
     );
   });
+}
+
+// ✅ NEW: normalize MathML + tokenize msqrt (cứu căn 100%)
+function normalizeMathMLForConvert(mml) {
+  let s = String(mml || "");
+
+  // 1) strip namespace prefix trong TÊN THẺ nhưng GIỮ </...>
+  //    <m:math> -> <math>, </m:math> -> </math>
+  s = s.replace(/<(\/?)([a-zA-Z0-9]+):/g, "<$1");
+
+  // 2) menclose radical -> msqrt (thủ phạm hay làm rơi căn)
+  const reRad =
+    /<menclose\b[^>]*\bnotation\s*=\s*"(?:radical|radical\s+\w+|\w+\s+radical)"[^>]*>([\s\S]*?)<\/menclose>/gi;
+  while (reRad.test(s)) s = s.replace(reRad, "<msqrt>$1</msqrt>");
+
+  // 3) chuẩn hoá entity √
+  s = s.replace(/&radic;|&#8730;|&#x221a;|&#x221A;/g, "√");
+
+  // 4) pattern phổ biến: <mo>√</mo> + (mrow/mi/mn) -> msqrt
+  const reMoSqrt =
+    /<mo>\s*√\s*<\/mo>\s*(<mrow>[\s\S]*?<\/mrow>|<mi>[\s\S]*?<\/mi>|<mn>[\s\S]*?<\/mn>)/gi;
+  while (reMoSqrt.test(s)) s = s.replace(reMoSqrt, "<msqrt>$1</msqrt>");
+
+  return s;
+}
+
+function tokenizeMsqrtBlocks(mathml) {
+  const s0 = String(mathml || "");
+  const re = /<\/?msqrt\b[^>]*>/gi;
+
+  const stack = [];
+  const blocks = [];
+
+  let m;
+  while ((m = re.exec(s0)) !== null) {
+    const tag = m[0];
+    const isClose = tag.startsWith("</");
+    if (!isClose) {
+      stack.push({ openStart: m.index, openEnd: re.lastIndex });
+    } else {
+      const open = stack.pop();
+      if (!open) continue;
+      blocks.push({
+        openStart: open.openStart,
+        openEnd: open.openEnd,
+        closeStart: m.index,
+        closeEnd: re.lastIndex,
+      });
+    }
+  }
+
+  if (!blocks.length) return { out: s0, tokens: [] };
+
+  // replace từ back -> front để index luôn đúng
+  blocks.sort((a, b) => b.openStart - a.openStart);
+
+  let out = s0;
+  const tokens = [];
+
+  let k = 1;
+  for (const b of blocks) {
+    const token = `__SQRT_TOKEN_${k++}__`;
+    const inner = out.slice(b.openEnd, b.closeStart);
+    tokens.push({ token, inner });
+
+    out =
+      out.slice(0, b.openStart) + `<mi>${token}</mi>` + out.slice(b.closeEnd);
+  }
+
+  return { out, tokens };
 }
 
 /* ================== LATEX POSTPROCESS ================== */
@@ -198,7 +288,8 @@ function sanitizeLatexStrict(latex) {
   }
   if (bal !== 0) broken = true;
 
-  if (broken) latex = latex.replace(/\\left\s*/g, "").replace(/\\right\s*/g, "");
+  if (broken)
+    latex = latex.replace(/\\left\s*/g, "").replace(/\\right\s*/g, "");
   return latex;
 }
 
@@ -327,11 +418,70 @@ function postProcessLatex(latex, mathmlMaybe = "") {
   return String(s || "").replace(/\s+/g, " ").trim();
 }
 
-function mathmlToLatexSafe(mml) {
+// ✅ NEW: radical-safe (tokenize msqrt -> rebuild \sqrt{...}) — GIỮ flow của bạn
+function mathmlToLatexSafe(mml, _depth = 0) {
   try {
-    if (!mml || !mml.includes("<math")) return "";
-    const latex0 = (MathMLToLaTeX.convert(mml) || "").trim();
-    return postProcessLatex(latex0, mml);
+    if (!mml) return "";
+    let m = String(mml);
+
+    // normalize sớm: <m:math> -> <math>, menclose radical -> msqrt, mo √ -> msqrt
+    m = normalizeMathMLForConvert(m);
+    if (!m.includes("<math")) return "";
+
+    const tok = tokenizeMsqrtBlocks(m);
+    const mTok = tok.out;
+
+    let latex0 = (MathMLToLaTeX.convert(mTok) || "").trim();
+    latex0 = postProcessLatex(latex0, mTok);
+
+    if (!tok.tokens.length) return latex0;
+
+    let out = latex0;
+
+    const depth = Number(_depth || 0);
+    const canRecurse = depth < 4;
+
+    const escapeRe = (x) => x.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+    for (const t of tok.tokens) {
+      const innerMath = `<math>${t.inner}</math>`;
+
+      let innerLatex = "";
+      if (canRecurse) {
+        innerLatex = mathmlToLatexSafe(innerMath, depth + 1);
+      } else {
+        innerLatex = (
+          MathMLToLaTeX.convert(normalizeMathMLForConvert(innerMath)) || ""
+        ).trim();
+        innerLatex = postProcessLatex(innerLatex, innerMath);
+      }
+
+      const repl = `\\sqrt{${innerLatex || ""}}`;
+
+      // restore token robust
+      const base = escapeRe(t.token);
+
+      // 1) token trần
+      out = out.replace(new RegExp(base, "g"), repl);
+
+      // 2) token trong wrapper LaTeX phổ biến
+      out = out.replace(
+        new RegExp(
+          String.raw`\\(?:text|mathrm|mathbf|operatorname)\s*\{\s*${base}\s*\}`,
+          "g"
+        ),
+        repl
+      );
+
+      // 3) token bị chèn khoảng trắng: cho phép \s* xen kẽ từng ký tự
+      const spaced = t.token
+        .split("")
+        .map((ch) => (ch === "_" ? "_\\s*" : `${escapeRe(ch)}\\s*`))
+        .join("");
+      out = out.replace(new RegExp(spaced, "g"), repl);
+    }
+
+    return String(out || "").replace(/\s+/g, " ").trim();
   } catch {
     return "";
   }
@@ -352,7 +502,9 @@ async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
     const oleTarget = rels.get(oleRid);
     if (!oleTarget) return block;
 
-    const vmlRid = block.match(/<v:imagedata\b[^>]*\br:id="([^"]+)"[^>]*\/>/);
+    const vmlRid = block.match(
+      /<v:imagedata\b[^>]*\br:id="([^"]+)"[^>]*\/>/
+    );
     const blipRid = block.match(/<a:blip\b[^>]*\br:embed="([^"]+)"[^>]*\/>/);
     const previewRid = vmlRid?.[1] || blipRid?.[1] || null;
 
@@ -451,7 +603,7 @@ async function tokenizeImagesAfter(docXml, rels, zipFiles) {
     );
   };
 
-  // ✅ FIX DUY NHẤT: bắt cả <a:blip .../> và <a:blip ...> + cả r:embed và r:link
+  // ✅ FIX: bắt cả r:embed và r:link, và tag có thể self-close hoặc không
   docXml = docXml.replace(
     /<a:blip\b[^>]*\br:(?:embed|link)="([^"]+)"[^>]*\/?>/g,
     (m, rid) => {
@@ -480,9 +632,7 @@ function convertRunsToHtml(fragmentXml) {
   let frag = String(fragmentXml || "");
 
   // Convert line breaks / tabs inside fragment
-  frag = frag
-    .replace(/<w:tab\s*\/>/g, "\t")
-    .replace(/<w:br\s*\/>/g, "\n");
+  frag = frag.replace(/<w:tab\s*\/>/g, "\t").replace(/<w:br\s*\/>/g, "\n");
 
   // Convert each run while preserving underline
   frag = frag.replace(/<w:r\b[\s\S]*?<\/w:r>/g, (run) => {
@@ -656,40 +806,32 @@ function extractSectionTitles(rawText) {
       i + 1 < sections.length ? sections[i + 1].startChar : text.length;
   }
 
-  // normalize tiêu đề nhiều dòng -> 1 dòng gọn (đúng “đủ nội dung”)
+  // normalize tiêu đề nhiều dòng -> 1 dòng gọn
   const normalizeTitle = (s) =>
     String(s || "")
       .replace(/\u00A0/g, " ")
       .replace(/[ \t]+\n/g, "\n")
       .replace(/\n{2,}/g, "\n")
       .trim()
-      // nếu muốn GIỮ xuống dòng: đổi " " thành "<br/>"
       .replace(/\s*\n\s*/g, " ")
       .replace(/\s+/g, " ")
       .trim();
 
   for (const sec of sections) {
-    // tìm câu đầu tiên thuộc vùng section
     const startIdx = qAnchors.findIndex(
       (q) => q.idx >= sec.startChar && q.idx < sec.endChar
     );
 
-    // vị trí cắt tiêu đề: trước "Câu ..."
     const firstQIdx = startIdx === -1 ? sec.endChar : qAnchors[startIdx].idx;
 
-    // lấy block title đầy đủ (nhiều dòng)
     let titleBlock = text.slice(sec.startChar, firstQIdx);
-
-    // bỏ khoảng trắng đầu
     titleBlock = titleBlock.replace(/^\s+/g, "");
 
-    // an toàn: nếu titleBlock lỡ chứa "Câu ..." thì cắt luôn
     const cut = titleBlock.search(/(^|\n)\s*Câu\s+\d+\./i);
     if (cut >= 0) titleBlock = titleBlock.slice(0, cut);
 
     sec.title = normalizeTitle(titleBlock);
 
-    // map question ranges giống logic cũ
     if (startIdx === -1) continue;
 
     let endIdx = qAnchors.length;
@@ -700,8 +842,8 @@ function extractSectionTitles(rawText) {
       }
     }
 
-    sec.questionIndexStart = startIdx; // 0-based
-    sec.questionIndexEnd = endIdx; // slice end
+    sec.questionIndexStart = startIdx;
+    sec.questionIndexEnd = endIdx;
     sec.questionCount = endIdx - startIdx;
     sec.firstQuestionNo = qAnchors[startIdx]?.no ?? null;
   }
@@ -992,10 +1134,7 @@ function attachSectionOrderToQuestions(exam, sections) {
 }
 
 /* ================= ✅ FIX UI: BUILD BLOCKS (SECTION + QUESTION) đúng thứ tự ================= */
-/**
- * Nếu frontend render `sections` riêng ở đầu trang => sẽ bị như ảnh của bạn.
- * => Tạo `blocks` đã TRỘN sẵn để frontend chỉ render theo blocks.
- */
+
 function buildOrderedBlocks(exam) {
   const blocks = [];
   let lastSec = null;
@@ -1069,13 +1208,8 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     res.json({
       ok: true,
       total: exam.questions.length,
-
-      // Nếu vẫn cần, vẫn trả sections (để debug)
       sections,
-
-      // ✅ QUAN TRỌNG: frontend hãy dùng blocks
       blocks,
-
       exam,
       questions,
       latex: latexMap,
