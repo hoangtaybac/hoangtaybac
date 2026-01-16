@@ -1,8 +1,9 @@
 // server.js
-// ✅ FULL CODE (FIX: PHẦN đúng vị trí + FIX mất căn thức \sqrt)
+// ✅ FULL CODE (FIX: PHẦN đúng vị trí + FIX mất căn thức \sqrt triệt để)
 // - Server trả `blocks` đã trộn section + question đúng thứ tự (frontend render chuẩn như Word)
 // - MathType OLE -> MathML -> LaTeX
-// - FIX HARD: nếu MathML có msqrt/mroot/radical nhưng LaTeX bị rơi \sqrt => tự bọc \sqrt{...}
+// - FIX: hỗ trợ MathML dạng <m:math>, <m:msqrt>..., menclose radical, và body không có <math>
+// - FIX HARD: nếu MathML có căn nhưng LaTeX bị rơi \sqrt => tự bọc \sqrt{...}
 //
 // Chạy: node server.js
 // Yêu cầu: inkscape (convert emf/wmf), ruby + mt2mml.rb (fallback MathType)
@@ -138,11 +139,10 @@ function extractMathMLFromOleScan(buf) {
   }
 
   // Sometimes namespaced form appears in raw
-  const utf8m = buf.toString("utf8");
-  i = utf8m.indexOf("<m:math");
+  i = utf8.indexOf("<m:math");
   if (i !== -1) {
-    let j = utf8m.indexOf("</m:math>", i);
-    if (j !== -1) return utf8m.slice(i, j + 9);
+    let j = utf8.indexOf("</m:math>", i);
+    if (j !== -1) return utf8.slice(i, j + 9);
   }
 
   return null;
@@ -171,26 +171,30 @@ function rubyOleToMathML(oleBuf) {
 
 /* ================== LATEX POSTPROCESS + SQRT FIX ================== */
 
-// include menclose radical as sqrt indicator too
 const SQRT_MATHML_RE =
   /(msqrt|mroot|menclose|radical|√|&#8730;|&#x221a;|&#x221A;|&radic;)/i;
+
+/** ✅ Strip prefixes in MathML tags: <m:msqrt> -> <msqrt> */
+function stripMathMLTagPrefixes(mathml) {
+  if (!mathml) return mathml;
+  let s = String(mathml);
+  s = s.replace(/<\s*\/\s*(m|mml|math)\s*:/gi, "</");
+  s = s.replace(/<\s*(m|mml|math)\s*:/gi, "<");
+  return s;
+}
 
 /** ✅ Add MathML namespace if missing */
 function ensureMathMLNamespace(mathml) {
   if (!mathml) return mathml;
   let s = String(mathml).replace(/<\?xml[^>]*\?>/gi, "").trim();
-
-  // handle <m:math ...> by leaving it; we add xmlns only for <math ...>
   s = s.replace(
     /<math(?![^>]*\bxmlns=)/i,
     '<math xmlns="http://www.w3.org/1998/Math/MathML"'
   );
-
-  // if namespaced <m:math> exists and no xmlns:m, we don't force-add (safe)
   return s;
 }
 
-/** (optional) Normalize <mtable ...> -> <mtable> */
+/** Normalize <mtable ...> -> <mtable> (some converters add attrs that break latex) */
 function normalizeMtable(mathml) {
   if (!mathml) return mathml;
   return String(mathml).replace(/<mtable\b[^>]*>/gi, "<mtable>");
@@ -198,23 +202,21 @@ function normalizeMtable(mathml) {
 
 /**
  * ✅ PREPROCESS MATHML FOR SQRT:
+ * - strip m: prefixes first
  * - menclose notation="radical" => msqrt
- * - <mo>√</mo> + next node      => msqrt
+ * - <mo>√</mo> + next node => msqrt
  */
 function preprocessMathMLForSqrt(mathml) {
   if (!mathml) return mathml;
-  let s = String(mathml);
+  let s = stripMathMLTagPrefixes(String(mathml));
 
   // 1) menclose radical -> msqrt
-  // <menclose notation="radical">X</menclose> => <msqrt>X</msqrt>
   s = s.replace(
     /<menclose\b([^>]*)\bnotation\s*=\s*["']radical["']([^>]*)>([\s\S]*?)<\/menclose>/gi,
     "<msqrt>$3</msqrt>"
   );
 
-  // Some MathType puts radical via entity in notation attr, still "radical" covers most.
-
-  // 2) sqrt symbol in <mo> ... </mo> followed by common nodes -> msqrt
+  // 2) <mo>√</mo> + node -> msqrt
   const moSqrt =
     String.raw`<mo>\s*(?:√|&#8730;|&#x221a;|&#x221A;|&radic;)\s*<\/mo>`;
 
@@ -241,33 +243,24 @@ function preprocessMathMLForSqrt(mathml) {
   return s;
 }
 
-/**
- * ✅ POSTPROCESS LATEX FOR SQRT
- */
+/** ✅ Post-process latex for sqrt leftovers */
 function postprocessLatexSqrt(latex) {
   if (!latex) return latex;
   let s = String(latex);
 
-  // Some converters output \surd instead of \sqrt
   s = s.replace(/\\surd\b/g, "\\sqrt{}");
 
-  // Fix: Sometimes √ symbol remains unconverted
   s = s.replace(/√\s*\{([^}]+)\}/g, "\\sqrt{$1}");
   s = s.replace(/√\s*\(([^)]+)\)/g, "\\sqrt{$1}");
   s = s.replace(/√\s*(\d+)/g, "\\sqrt{$1}");
   s = s.replace(/√\s*([a-zA-Z])/g, "\\sqrt{$1}");
 
-  // Fix: \sqrt without braces - add braces for single token
   s = s.replace(/\\sqrt\s+(\d+)(?![}\d])/g, "\\sqrt{$1}");
   s = s.replace(/\\sqrt\s+([a-zA-Z])(?![}\w])/g, "\\sqrt{$1}");
 
-  // Fix: Empty sqrt
   s = s.replace(/\\sqrt\s*\{\s*\}/g, "\\sqrt{\\phantom{x}}");
-
-  // Fix: Malformed sqrt with extra spaces
   s = s.replace(/\\sqrt\s+\{/g, "\\sqrt{");
 
-  // Fix: nth root - \root{n}\of{x} -> \sqrt[n]{x}
   s = s.replace(
     /\\root\s*\{([^}]+)\}\s*\\of\s*\{([^}]+)\}/g,
     "\\sqrt[$1]{$2}"
@@ -411,13 +404,12 @@ function fixPiecewiseFunction(latex) {
 
 /**
  * ✅ FIX MẤT CĂN THỨC (HARD):
- * Nếu MathML có msqrt/mroot/menclose radical nhưng converter trả latex bị rơi \sqrt => bọc lại \sqrt{...}
+ * Nếu MathML có msqrt/mroot/menclose radical nhưng LaTeX bị rơi \sqrt => bọc lại \sqrt{...}
  */
 function fixSqrtLatex(latex, mathmlMaybe = "") {
   let s = String(latex || "").trim();
   const mml = String(mathmlMaybe || "");
 
-  // Convert literal sqrt symbol if it survived into LaTeX string
   s = s.replace(/√\s*\(\s*([\s\S]*?)\s*\)/g, "\\sqrt{$1}");
   s = s.replace(/√\s*([A-Za-z0-9]+)\b/g, "\\sqrt{$1}");
 
@@ -429,7 +421,6 @@ function fixSqrtLatex(latex, mathmlMaybe = "") {
 
   const latexHasSqrt = /\\sqrt\b|\\root\b/.test(s);
 
-  // HARD WRAP (chỉ khi chắc chắn MathML có radical)
   if (mmlHasSqrt && !latexHasSqrt) {
     if (!s) return "\\sqrt{}";
     return `\\sqrt{${s}}`;
@@ -445,10 +436,7 @@ function postProcessLatex(latex, mathmlMaybe = "") {
   s = restoreArrowAndCoreCommands(s);
   s = fixPiecewiseFunction(s);
 
-  // ✅ soft sqrt fixes first
   s = postprocessLatexSqrt(s);
-
-  // ✅ hard wrap last
   s = fixSqrtLatex(s, mathmlMaybe);
 
   return String(s || "").replace(/\s+/g, " ").trim();
@@ -456,26 +444,27 @@ function postProcessLatex(latex, mathmlMaybe = "") {
 
 /**
  * ✅ IMPORTANT FIX:
- * Accept MathML that is:
- * - <math ...>...</math>
- * - <m:math ...>...</m:math>
- * - or only a MathML body (<mrow>...</mrow> etc) => auto-wrap into <math ...>
+ * Accept MathML:
+ * - <math>...</math>
+ * - <m:math>...</m:math> (we strip prefix)
+ * - OR only body (<mrow>...</mrow>) => auto-wrap into <math ...>
  */
 function mathmlToLatexSafe(mml) {
   try {
     if (!mml) return "";
     let mm = String(mml).trim();
 
-    const hasMathTag = /<\w*:?\s*math\b/i.test(mm);
+    // ✅ strip m: prefixes first
+    mm = stripMathMLTagPrefixes(mm);
+
+    const hasMathTag = /<\s*math\b/i.test(mm);
     const looksLikeMathMLBody =
       /<(mrow|mi|mn|mo|msqrt|mroot|mfrac|msup|msub|msubsup|menclose)\b/i.test(mm);
 
     if (!hasMathTag && looksLikeMathMLBody) {
       mm = `<math xmlns="http://www.w3.org/1998/Math/MathML">${mm}</math>`;
     }
-
-    // still not math => fail fast
-    if (!/<\w*:?\s*math\b/i.test(mm)) return "";
+    if (!/<\s*math\b/i.test(mm)) return "";
 
     mm = ensureMathMLNamespace(mm);
     mm = normalizeMtable(mm);
