@@ -593,8 +593,7 @@ function normalizeUnderlinedMarkersForSplit(s) {
 
 function findSolutionMarkerIndex(text, fromIndex = 0) {
   const s = String(text || "");
-  const re =
-    /(Lời\s*giải|Giải\s*chi\s*tiết|Hướng\s*dẫn\s*giải)/i;
+  const re = /(Lời\s*giải|Giải\s*chi\s*tiết|Hướng\s*dẫn\s*giải)/i;
   const sub = s.slice(fromIndex);
   const m = re.exec(sub);
   if (!m) return -1;
@@ -699,25 +698,33 @@ function splitStatementsTextabcd(blockText) {
  * - short: stem + boxes + solution/detail
  *
  * Đồng thời vẫn trả thêm "questions" cũ để bạn không bị vỡ front cũ.
+ *
+ * ✅ FIX: GIỮ TIÊU ĐỀ "PHẦN ..." và gắn vào từng câu -> field `section`
  */
 function parseExamFromText(text) {
-  const blocks = String(text || "").split(/(?=Câu\s+\d+\.)/);
-  const exam = { version: 9, questions: [] };
+  const s = String(text || "").replace(/\r/g, "");
+  const lines = s.split("\n");
 
-  for (const block of blocks) {
-    if (!/^Câu\s+\d+\./i.test(block)) continue;
+  const exam = { version: 10, questions: [] };
 
-    const qnoMatch = block.match(/^Câu\s+(\d+)\./i);
+  let currentSection = null; // ✅ tiêu đề PHẦN hiện tại
+  let buffer = "";
+
+  const flushQuestionBlock = (block) => {
+    const b = String(block || "").trim();
+    if (!/^Câu\s+\d+\./i.test(b)) return;
+
+    const qnoMatch = b.match(/^Câu\s+(\d+)\./i);
     const no = qnoMatch ? Number(qnoMatch[1]) : null;
 
-    const under = extractUnderlinedKeys(block);
-    const plain = stripTagsToPlain(block);
+    const under = extractUnderlinedKeys(b);
+    const plain = stripTagsToPlain(b);
 
     const isMCQ = detectHasMCQ(plain);
     const isTF4 = !isMCQ && detectHasTF4(plain);
 
     if (isMCQ) {
-      const parts = splitChoicesTextABCD(block);
+      const parts = splitChoicesTextABCD(b);
       const tail = parts?.tail || "";
       const solParts = splitSolutionSections(tail);
 
@@ -725,8 +732,9 @@ function parseExamFromText(text) {
 
       exam.questions.push({
         no,
+        section: currentSection, // ✅ thêm PHẦN
         type: "mcq",
-        stem: cleanStemFromQuestionNo(parts?.stem || block),
+        stem: cleanStemFromQuestionNo(parts?.stem || b),
         choices: {
           A: parts?.choices?.A || "",
           B: parts?.choices?.B || "",
@@ -738,11 +746,11 @@ function parseExamFromText(text) {
         detail: solParts.detail || "",
         _plain: plain,
       });
-      continue;
+      return;
     }
 
     if (isTF4) {
-      const parts = splitStatementsTextabcd(block);
+      const parts = splitStatementsTextabcd(b);
       const tail = parts?.tail || "";
       const solParts = splitSolutionSections(tail);
 
@@ -753,8 +761,9 @@ function parseExamFromText(text) {
 
       exam.questions.push({
         no,
+        section: currentSection, // ✅ thêm PHẦN
         type: "tf4",
-        stem: cleanStemFromQuestionNo(parts?.stem || block),
+        stem: cleanStemFromQuestionNo(parts?.stem || b),
         statements: {
           a: parts?.statements?.a || "",
           b: parts?.statements?.b || "",
@@ -766,18 +775,18 @@ function parseExamFromText(text) {
         detail: solParts.detail || "",
         _plain: plain,
       });
-      continue;
+      return;
     }
 
     // short / tự luận
-    const solIdx = findSolutionMarkerIndex(block, 0);
-    const stemPart = solIdx >= 0 ? block.slice(0, solIdx).trim() : block.trim();
-    const tailPart = solIdx >= 0 ? block.slice(solIdx).trim() : "";
-
+    const solIdx = findSolutionMarkerIndex(b, 0);
+    const stemPart = solIdx >= 0 ? b.slice(0, solIdx).trim() : b.trim();
+    const tailPart = solIdx >= 0 ? b.slice(solIdx).trim() : "";
     const solParts = splitSolutionSections(tailPart);
 
     exam.questions.push({
       no,
+      section: currentSection, // ✅ thêm PHẦN
       type: "short",
       stem: cleanStemFromQuestionNo(stemPart),
       boxes: 4,
@@ -785,8 +794,31 @@ function parseExamFromText(text) {
       detail: solParts.detail || "",
       _plain: plain,
     });
+  };
+
+  for (const line of lines) {
+    const t = line.trim();
+    if (!t) continue;
+
+    // ✅ gặp tiêu đề PHẦN -> lưu lại
+    if (/^PHẦN\s*\d+\./i.test(t)) {
+      flushQuestionBlock(buffer);
+      buffer = "";
+
+      currentSection = t; // giữ nguyên nội dung PHẦN
+      continue;
+    }
+
+    // bắt đầu 1 câu mới
+    if (/^Câu\s+\d+\./i.test(t)) {
+      flushQuestionBlock(buffer);
+      buffer = t + "\n";
+    } else {
+      buffer += t + "\n";
+    }
   }
 
+  flushQuestionBlock(buffer);
   return exam;
 }
 
@@ -846,7 +878,7 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     // 3) text ✅ giữ token + underline
     const text = wordXmlToTextKeepTokens(docXml);
 
-    // 4) NEW: parse exam output (mcq/tf4/short)
+    // 4) NEW: parse exam output (mcq/tf4/short) ✅ giờ có section=PHẦN...
     const exam = parseExamFromText(text);
 
     // 5) legacy questions output (mcq only) for backward compatibility
