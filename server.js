@@ -602,11 +602,12 @@ function wordXmlToTextKeepTokens(docXml) {
 
   return x;
 }
-
 /* ================= SECTION TITLES (PHẦN ...) ================= */
 /**
- * Trả về sections theo VỊ TRÍ ký tự (startChar/endChar) + index câu toàn cục.
- * Không lệch khi mỗi PHẦN reset "Câu 1."
+ * ✅ FIX: lấy ĐẦY ĐỦ tiêu đề PHẦN nhiều dòng/ nhiều đoạn trong Word
+ * - Không chỉ lấy 1 dòng nữa
+ * - Cắt title theo vùng: từ "PHẦN ..." đến ngay trước "Câu X."
+ * - Vẫn giữ mapping questionIndexStart/End như cũ
  */
 function extractSectionTitles(rawText) {
   const text = String(rawText || "").replace(/\r/g, "");
@@ -622,21 +623,16 @@ function extractSectionTitles(rawText) {
     });
   }
 
-  // anchors "PHẦN ..."
+  // anchors "PHẦN ..." (chỉ cần bắt vị trí, không ép 1 dòng)
   const sRe =
-    /(^|\n)\s*(?:[-•–]\s*)?PHẦN\s+([0-9]+|[IVXLCDM]+)\s*[\.\:\-]?\s*([^\n]*)/gi;
+    /(^|\n)\s*(?:[-•–]\s*)?PHẦN\s+([0-9]+|[IVXLCDM]+)\s*[\.\:\-]?\s*/gi;
 
   const sections = [];
   let sm;
   while ((sm = sRe.exec(text)) !== null) {
     const startChar = sm.index + (sm[1] ? sm[1].length : 0);
-
-    let titleLine = `PHẦN ${sm[2]}. ${sm[3] || ""}`.trim();
-    const cutIdx = titleLine.search(/(?=\bCâu\s+\d+\.)/i);
-    if (cutIdx > 0) titleLine = titleLine.slice(0, cutIdx).trim();
-
     sections.push({
-      title: titleLine,
+      title: "",
       order: sections.length + 1,
       startChar,
       endChar: null,
@@ -644,18 +640,50 @@ function extractSectionTitles(rawText) {
       questionCount: 0,
       questionIndexStart: null,
       questionIndexEnd: null,
+      _phanLabel: sm[2], // debug nếu cần
     });
   }
 
+  // endChar theo section kế tiếp
   for (let i = 0; i < sections.length; i++) {
     sections[i].endChar =
       i + 1 < sections.length ? sections[i + 1].startChar : text.length;
   }
 
+  // normalize tiêu đề nhiều dòng -> 1 dòng gọn (đúng “đủ nội dung”)
+  const normalizeTitle = (s) =>
+    String(s || "")
+      .replace(/\u00A0/g, " ")
+      .replace(/[ \t]+\n/g, "\n")
+      .replace(/\n{2,}/g, "\n")
+      .trim()
+      // nếu muốn GIỮ xuống dòng: đổi " " thành "<br/>"
+      .replace(/\s*\n\s*/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+
   for (const sec of sections) {
+    // tìm câu đầu tiên thuộc vùng section
     const startIdx = qAnchors.findIndex(
       (q) => q.idx >= sec.startChar && q.idx < sec.endChar
     );
+
+    // vị trí cắt tiêu đề: trước "Câu ..."
+    const firstQIdx = startIdx === -1 ? sec.endChar : qAnchors[startIdx].idx;
+
+    // lấy block title đầy đủ (nhiều dòng)
+    let titleBlock = text.slice(sec.startChar, firstQIdx);
+
+    // bỏ khoảng trắng đầu
+    titleBlock = titleBlock.replace(/^\s+/g, "");
+
+    // an toàn: nếu titleBlock lỡ chứa "Câu ..." thì cắt luôn
+    const cut = titleBlock.search(/(^|\n)\s*Câu\s+\d+\./i);
+    if (cut >= 0) titleBlock = titleBlock.slice(0, cut);
+
+    sec.title = normalizeTitle(titleBlock);
+
+    // map question ranges giống logic cũ
     if (startIdx === -1) continue;
 
     let endIdx = qAnchors.length;
