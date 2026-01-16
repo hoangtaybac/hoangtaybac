@@ -1,7 +1,8 @@
 // server.js
-// ✅ FULL CODE (FIX: tiêu đề PHẦN đúng vị trí như file Word gốc)
+// ✅ FULL CODE (FIX: tiêu đề PHẦN đúng vị trí như file Word gốc + GIỮ BẢNG trong Word)
 // - Không lệch khi mỗi PHẦN reset "Câu 1."
 // - Server trả thêm `blocks` đã trộn (section + question) đúng thứ tự để frontend render chuẩn.
+// - ✅ NEW: Giữ được bảng <w:tbl> và nội dung trong bảng (kể cả underline + token math/img)
 //
 // Chạy: node server.js
 // Yêu cầu: inkscape (convert emf/wmf), ruby + mt2mml.rb (fallback MathType)
@@ -468,17 +469,99 @@ async function tokenizeImagesAfter(docXml, rels, zipFiles) {
   return { outXml: docXml, imgMap };
 }
 
-/* ================= Text (GIỮ token + underline) ================= */
+/* ================= ✅ TABLE SUPPORT (GIỮ BẢNG + NỘI DUNG TRONG Ô) ================= */
+
+function convertRunsToHtml(fragmentXml) {
+  let frag = String(fragmentXml || "");
+
+  // Convert line breaks / tabs inside fragment
+  frag = frag
+    .replace(/<w:tab\s*\/>/g, "\t")
+    .replace(/<w:br\s*\/>/g, "\n");
+
+  // Convert each run while preserving underline
+  frag = frag.replace(/<w:r\b[\s\S]*?<\/w:r>/g, (run) => {
+    const hasU =
+      /<w:u\b[^>]*\/>/.test(run) &&
+      !/<w:u\b[^>]*w:val="none"[^>]*\/>/.test(run);
+
+    let inner = run.replace(/<w:rPr\b[\s\S]*?<\/w:rPr>/g, "");
+    inner = inner.replace(/<w:t\b[^>]*>([\s\S]*?)<\/w:t>/g, (_, t) => t ?? "");
+    inner = inner.replace(
+      /<w:instrText\b[^>]*>([\s\S]*?)<\/w:instrText>/g,
+      (_, t) => t ?? ""
+    );
+
+    inner = inner.replace(/<[^>]+>/g, "");
+    if (!inner) return "";
+    return hasU ? `<u>${inner}</u>` : inner;
+  });
+
+  // Remove all other tags in fragment, keep <u>
+  frag = frag.replace(/<(?!\/?u\b)[^>]+>/g, "");
+
+  // Decode entities
+  frag = decodeXmlEntities(frag);
+
+  // Normalize
+  frag = frag.replace(/\r/g, "");
+  frag = frag.replace(/[ \t]+\n/g, "\n").trim();
+  return frag;
+}
+
+function convertParagraphsToHtml(parXml) {
+  let p = String(parXml || "");
+  p = convertRunsToHtml(p);
+  return p;
+}
+
+function wordTableXmlToHtmlTable(tblXml) {
+  const tbl = String(tblXml || "");
+  const rows = tbl.match(/<w:tr\b[\s\S]*?<\/w:tr>/g) || [];
+
+  let html = `<table class="doc-table">`;
+
+  for (const tr of rows) {
+    html += `<tr>`;
+    const cells = tr.match(/<w:tc\b[\s\S]*?<\/w:tc>/g) || [];
+
+    for (const tc of cells) {
+      const ps = tc.match(/<w:p\b[\s\S]*?<\/w:p>/g) || [];
+      const parts = ps.map(convertParagraphsToHtml).filter(Boolean);
+      const cellHtml = parts.join("<br/>").trim();
+      html += `<td>${cellHtml || ""}</td>`;
+    }
+
+    html += `</tr>`;
+  }
+
+  html += `</table>`;
+  return html;
+}
+
+/* ================= Text (GIỮ token + underline + ✅ TABLE) ================= */
 
 function wordXmlToTextKeepTokens(docXml) {
-  let x = docXml
-    .replace(/<w:tab\s*\/>/g, "\t")
-    .replace(/<w:br\s*\/>/g, "\n")
-    .replace(/<\/w:p>/g, "\n");
+  let x = String(docXml || "");
 
   // Protect tokens BEFORE stripping tags
   x = x.replace(/\[!m:\$\$?(.*?)\$\$?\]/g, "___MATH_TOKEN___$1___END___");
   x = x.replace(/\[!img:\$\$?(.*?)\$\$?\]/g, "___IMG_TOKEN___$1___END___");
+
+  // ✅ Convert ALL <w:tbl> to HTML tables and keep them
+  const tableMap = {};
+  let tableIdx = 0;
+
+  x = x.replace(/<w:tbl\b[\s\S]*?<\/w:tbl>/g, (tblBlock) => {
+    const key = `___TABLE_TOKEN___${++tableIdx}___END___`;
+    tableMap[key] = wordTableXmlToHtmlTable(tblBlock);
+    return key;
+  });
+
+  x = x
+    .replace(/<w:tab\s*\/>/g, "\t")
+    .replace(/<w:br\s*\/>/g, "\n")
+    .replace(/<\/w:p>/g, "\n");
 
   // Convert each run while preserving underline
   x = x.replace(/<w:r\b[\s\S]*?<\/w:r>/g, (run) => {
@@ -498,8 +581,13 @@ function wordXmlToTextKeepTokens(docXml) {
     return hasU ? `<u>${inner}</u>` : inner;
   });
 
-  // Remove remaining tags outside runs, but keep <u>
-  x = x.replace(/<(?!\/?u\b)[^>]+>/g, "");
+  // Remove remaining tags outside runs, but keep <u> + table tags
+  x = x.replace(/<(?!\/?(u|table|tr|td|br)\b)[^>]+>/g, "");
+
+  // Restore tables
+  for (const [k, v] of Object.entries(tableMap)) {
+    x = x.split(k).join(v);
+  }
 
   // Restore tokens stable form
   x = x
@@ -923,7 +1011,7 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     docXml = imgTok.outXml;
     Object.assign(images, imgTok.imgMap);
 
-    // 3) text (giữ token + underline)
+    // 3) text (giữ token + underline + ✅ TABLE)
     const text = wordXmlToTextKeepTokens(docXml);
 
     // 4) parse exam output (GIỮ NGUYÊN)
