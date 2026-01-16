@@ -1,3 +1,10 @@
+// server.js
+// ✅ FULL CODE (đã sửa phần TIÊU ĐỀ PHẦN trả về đúng thứ tự/vị trí như file gốc)
+// Chạy: node server.js
+// Yêu cầu: inkscape (để convert emf/wmf), ruby + mt2mml.rb (fallback MathType)
+//
+// npm i express multer unzipper cors mathml-to-latex
+
 import express from "express";
 import multer from "multer";
 import unzipper from "unzipper";
@@ -252,7 +259,6 @@ function restoreArrowAndCoreCommands(latex) {
 function fixPiecewiseFunction(latex) {
   let s = String(latex || "");
 
-  // Fix broken parentheses/brackets like "(. " "[. "
   s = s.replace(/\(\.\s+/g, "(");
   s = s.replace(/\s+\.\)/g, ")");
   s = s.replace(/\[\.\s+/g, "[");
@@ -287,7 +293,6 @@ function fixPiecewiseFunction(latex) {
 
     let content = s.slice(contentStart, endIdx).trim();
     content = content.replace(/\s+\.\s*$/, "");
-    // normalize new rows
     content = content.replace(/\s+\\\s+(?=\d)/g, " \\\\ ");
 
     const before = s.slice(0, startIdx);
@@ -304,9 +309,7 @@ function fixPiecewiseFunction(latex) {
 function fixSqrtLatex(latex, mathmlMaybe = "") {
   let s = String(latex || "");
 
-  // √(x+1) => \sqrt{x+1}
   s = s.replace(/√\s*\(\s*([\s\S]*?)\s*\)/g, "\\sqrt{$1}");
-  // √x => \sqrt{x}
   s = s.replace(/√\s*([A-Za-z0-9]+)\b/g, "\\sqrt{$1}");
 
   if (SQRT_MATHML_RE.test(String(mathmlMaybe || ""))) {
@@ -376,11 +379,9 @@ async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
       const oleFull = normalizeTargetToWordPath(info.oleTarget);
       const oleBuf = await getZipEntryBuffer(zipFiles, oleFull);
 
-      // 1) scan MathML inside OLE
       let mml = "";
       if (oleBuf) mml = extractMathMLFromOleScan(oleBuf) || "";
 
-      // 2) fallback ruby
       if (!mml && oleBuf) {
         try {
           mml = await rubyOleToMathML(oleBuf);
@@ -389,14 +390,12 @@ async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
         }
       }
 
-      // 3) MathML -> LaTeX
       const latex = mml ? mathmlToLatexSafe(mml) : "";
       if (latex) {
         latexMap[key] = latex;
         return;
       }
 
-      // 4) fallback preview image
       if (info.previewRid) {
         const t = rels.get(info.previewRid);
         if (t) {
@@ -532,44 +531,51 @@ function wordXmlToTextKeepTokens(docXml) {
   return x;
 }
 
-/* ================= SECTION TITLES (PHẦN ...) ✅ BỔ SUNG ================= */
+/* ================= SECTION TITLES (PHẦN ...) ✅ FIX ĐÚNG VỊ TRÍ/THỨ TỰ ================= */
 
 /**
- * Lấy các tiêu đề kiểu:
- * - "PHẦN 1. ..."
- * - "PHẦN 2: ..."
- * - "PHẦN I. ..." (roman)
- * Trả về theo thứ tự xuất hiện trong rawText.
- * ✅ Không thay đổi thuật toán parseExamFromText của bạn.
+ * ✅ Mục tiêu:
+ * - Trả về sections đúng thứ tự như file gốc
+ * - Không bị dính "Câu X." nếu PHẦN và Câu nằm cùng 1 dòng
+ * - Không dedupe làm mất phần
+ * - firstQuestionNo dò cả phần còn lại của dòng hiện tại + các dòng sau
+ * ❗ Không đụng vào parseExamFromText
  */
 function extractSectionTitles(rawText) {
   const s = String(rawText || "").replace(/\r/g, "");
   const lines = s.split("\n");
 
   const sections = [];
-  const seen = new Set();
 
+  // PHẦN 1., PHẦN 2:, PHẦN I., ...
   const re = /^\s*PHẦN\s+([0-9]+|[IVXLCDM]+)\s*[\.\:\-]?\s*(.*)\s*$/i;
 
   for (let i = 0; i < lines.length; i++) {
-    const line = lines[i].trim();
-    if (!line) continue;
+    const line0 = (lines[i] || "").trim();
+    if (!line0) continue;
 
-    const m = re.exec(line);
+    const m = re.exec(line0);
     if (!m) continue;
 
-    const title = line; // giữ nguyên đúng như rawText
-    const key = title.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
+    // Nếu cùng dòng có "Câu X." thì cắt title trước "Câu"
+    let title = line0;
+    const cutIdx = title.search(/(?=\bCâu\s+\d+\.)/i);
+    if (cutIdx > 0) title = title.slice(0, cutIdx).trim();
 
-    // tìm câu đầu tiên phía sau tiêu đề (nếu có)
+    // Tìm câu đầu tiên: ưu tiên phần còn lại cùng dòng, rồi mới tới các dòng sau
     let firstQuestionNo = null;
-    for (let j = i + 1; j < Math.min(i + 80, lines.length); j++) {
-      const q = lines[j].match(/^\s*Câu\s+(\d+)\./i);
-      if (q) {
-        firstQuestionNo = Number(q[1]);
-        break;
+
+    const restSameLine = cutIdx > 0 ? line0.slice(cutIdx) : "";
+    const qSame = restSameLine.match(/\bCâu\s+(\d+)\./i);
+    if (qSame) firstQuestionNo = Number(qSame[1]);
+
+    if (firstQuestionNo == null) {
+      for (let j = i + 1; j < Math.min(i + 120, lines.length); j++) {
+        const q = (lines[j] || "").match(/^\s*Câu\s+(\d+)\./i);
+        if (q) {
+          firstQuestionNo = Number(q[1]);
+          break;
+        }
       }
     }
 
@@ -873,13 +879,13 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     // 3) text (giữ token + underline)
     const text = wordXmlToTextKeepTokens(docXml);
 
-    // ✅ BỔ SUNG: lấy tiêu đề PHẦN từ rawText (KHÔNG thay đổi thuật toán parse câu)
+    // ✅ sections đúng thứ tự/vị trí theo rawText
     const sections = extractSectionTitles(text);
 
     // 4) parse exam output (mcq/tf4/short) — GIỮ NGUYÊN
     const exam = parseExamFromText(text);
 
-    // ✅ BỔ SUNG: nhét sections vào exam (chỉ thêm field mới)
+    // ✅ chỉ thêm field mới, không sửa thuật toán
     exam.sections = sections;
 
     // 5) legacy questions output (mcq only)
@@ -888,10 +894,7 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     res.json({
       ok: true,
       total: exam.questions.length,
-
-      // ✅ BỔ SUNG: sections ở top-level (dễ dùng cho front)
       sections,
-
       exam,
       questions,
       latex: latexMap,
