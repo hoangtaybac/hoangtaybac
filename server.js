@@ -1,7 +1,11 @@
 // server.js
-// ✅ FULL CODE (FIX: tiêu đề PHẦN đúng vị trí như file Word gốc)
+// ✅ FULL CODE (FIX: tiêu đề PHẦN đúng vị trí như file Word gốc + FIX mất căn thức \sqrt)
 // - Không lệch khi mỗi PHẦN reset "Câu 1."
 // - Server trả thêm `blocks` đã trộn (section + question) đúng thứ tự để frontend render chuẩn.
+// - MathType OLE -> MathML -> LaTeX
+// - FIX: strip namespace prefix m: (m:math / m:msqrt / m:mroot...) để converter nhận đúng
+// - FIX: menclose notation="radical" => msqrt
+// - FIX: nếu MathML có radical nhưng latex bị rơi \sqrt => HARD rebuild sqrt/root từ MathML
 //
 // Chạy: node server.js
 // Yêu cầu: inkscape (convert emf/wmf), ruby + mt2mml.rb (fallback MathType)
@@ -162,7 +166,32 @@ function rubyOleToMathML(oleBuf) {
 
 /* ================== LATEX POSTPROCESS ================== */
 
-const SQRT_MATHML_RE = /(msqrt|mroot|√|&#8730;|&#x221a;|&#x221A;|&radic;)/i;
+// Detect sqrt in MathML (covers msqrt/mroot + menclose radical + entities)
+const SQRT_MATHML_RE =
+  /(<\s*msqrt\b|<\s*mroot\b|<\s*menclose\b[^>]*notation\s*=\s*["']radical["']|√|&#8730;|&#x221a;|&#x221A;|&radic;)/i;
+
+// 1) Strip namespace prefixes like <m:msqrt> -> <msqrt>, </m:msqrt> -> </msqrt>
+// 2) Convert <menclose notation="radical">...</menclose> -> <msqrt>...</msqrt>
+// 3) Strip prefixed attributes (rare)
+function normalizeMathML(mml = "") {
+  let s = String(mml || "");
+
+  // remove tag prefixes: <m:tag ...> or </m:tag>
+  s = s.replace(/<\s*(\/?)\s*([A-Za-z0-9_]+):/g, "<$1");
+
+  // remove attribute prefixes: m:attr="..." -> attr="..."
+  s = s.replace(/(\s)[A-Za-z0-9_]+:([A-Za-z0-9_\-]+)=/g, "$1$2=");
+
+  // menclose radical => msqrt
+  s = s.replace(
+    /<\s*menclose\b[^>]*notation\s*=\s*["']radical["'][^>]*>/gi,
+    "<msqrt>"
+  );
+  s = s.replace(/<\s*menclose\b[^>]*>/gi, "<msqrt>");
+  s = s.replace(/<\s*\/\s*menclose\s*>/gi, "</msqrt>");
+
+  return s;
+}
 
 function sanitizeLatexStrict(latex) {
   if (!latex) return latex;
@@ -299,9 +328,11 @@ function fixPiecewiseFunction(latex) {
 function fixSqrtLatex(latex, mathmlMaybe = "") {
   let s = String(latex || "");
 
+  // Some weird cases might leave a literal sqrt sign
   s = s.replace(/√\s*\(\s*([\s\S]*?)\s*\)/g, "\\sqrt{$1}");
   s = s.replace(/√\s*([A-Za-z0-9]+)\b/g, "\\sqrt{$1}");
 
+  // If MathML indicates radical but converter returns something like "radic"
   if (SQRT_MATHML_RE.test(String(mathmlMaybe || ""))) {
     const hasSqrt = /\\sqrt\b|\\root\b/.test(s);
     if (!hasSqrt && s) {
@@ -322,11 +353,149 @@ function postProcessLatex(latex, mathmlMaybe = "") {
   return String(s || "").replace(/\s+/g, " ").trim();
 }
 
+/* ================= HARD sqrt/root fallback from MathML ================= */
+
+function extractFirstTagInner(xml, tag) {
+  const s = String(xml || "");
+  const openRe = new RegExp(`<\\s*${tag}\\b[^>]*>`, "i");
+  const m = openRe.exec(s);
+  if (!m) return null;
+
+  const startOpen = m.index;
+  const startInner = startOpen + m[0].length;
+
+  const anyTagRe = /<\s*\/?\s*[A-Za-z0-9_]+\b[^>]*>/g;
+  anyTagRe.lastIndex = startInner;
+
+  let depth = 1;
+  let mm;
+
+  while ((mm = anyTagRe.exec(s)) !== null) {
+    const t = mm[0];
+    const isClose = /^<\s*\//.test(t);
+
+    const nameMatch = t.match(/^<\s*\/?\s*([A-Za-z0-9_]+)/);
+    const name = nameMatch ? nameMatch[1].toLowerCase() : "";
+
+    if (name !== String(tag).toLowerCase()) continue;
+
+    if (!isClose) depth++;
+    else depth--;
+
+    if (depth === 0) {
+      const endInner = mm.index;
+      return s.slice(startInner, endInner);
+    }
+  }
+
+  return s.slice(startInner);
+}
+
+function splitTopLevelChildren(inner) {
+  const s = String(inner || "").trim();
+  if (!s) return [];
+
+  const parts = [];
+  let depth = 0;
+  let last = 0;
+
+  const re = /<\s*\/?\s*[A-Za-z0-9_]+\b[^>]*>/g;
+  let m;
+
+  while ((m = re.exec(s)) !== null) {
+    const tag = m[0];
+    const isClose = /^<\s*\//.test(tag);
+    const isSelfClose = /\/\s*>$/.test(tag);
+
+    if (!isClose && !isSelfClose) {
+      if (depth === 0 && m.index > last) {
+        const txt = s.slice(last, m.index).trim();
+        if (txt) parts.push(txt);
+        last = m.index;
+      }
+      depth++;
+    } else if (isClose) {
+      depth = Math.max(0, depth - 1);
+      if (depth === 0) {
+        const segEnd = m.index + tag.length;
+        const seg = s.slice(last, segEnd).trim();
+        if (seg) parts.push(seg);
+        last = segEnd;
+      }
+    } else {
+      // self close at top-level
+      if (depth === 0) {
+        const segEnd = m.index + tag.length;
+        const seg = s.slice(last, segEnd).trim();
+        if (seg) parts.push(seg);
+        last = segEnd;
+      }
+    }
+  }
+
+  const tail = s.slice(last).trim();
+  if (tail) parts.push(tail);
+
+  return parts;
+}
+
+function hardSqrtFromMathML(normMml) {
+  const mml = String(normMml || "");
+  if (!mml.includes("<math")) return "";
+
+  // msqrt
+  if (/<\s*msqrt\b/i.test(mml)) {
+    const inner = extractFirstTagInner(mml, "msqrt");
+    if (inner != null) {
+      const wrapped = `<math>${inner}</math>`;
+      const innerLatex = (MathMLToLaTeX.convert(wrapped) || "").trim();
+      const fixedInner = postProcessLatex(innerLatex, wrapped);
+      return fixedInner ? `\\sqrt{${fixedInner}}` : "\\sqrt{}";
+    }
+  }
+
+  // mroot: order base then index in MathML
+  if (/<\s*mroot\b/i.test(mml)) {
+    const inner = extractFirstTagInner(mml, "mroot");
+    if (inner != null) {
+      const kids = splitTopLevelChildren(inner);
+      if (kids.length >= 2) {
+        const baseM = `<math>${kids[0]}</math>`;
+        const idxM = `<math>${kids[1]}</math>`;
+        const baseL = postProcessLatex(
+          (MathMLToLaTeX.convert(baseM) || "").trim(),
+          baseM
+        );
+        const idxL = postProcessLatex(
+          (MathMLToLaTeX.convert(idxM) || "").trim(),
+          idxM
+        );
+        if (baseL && idxL) return `\\sqrt[${idxL}]{${baseL}}`;
+        if (baseL) return `\\sqrt{${baseL}}`;
+      }
+    }
+  }
+
+  return "";
+}
+
 function mathmlToLatexSafe(mml) {
   try {
-    if (!mml || !mml.includes("<math")) return "";
-    const latex0 = (MathMLToLaTeX.convert(mml) || "").trim();
-    return postProcessLatex(latex0, mml);
+    if (!mml || !String(mml).includes("<math")) return "";
+
+    // ✅ normalize prefixes + menclose radical
+    const norm = normalizeMathML(mml);
+
+    const latex0 = (MathMLToLaTeX.convert(norm) || "").trim();
+    let out = postProcessLatex(latex0, norm);
+
+    // ✅ nếu MathML có radical nhưng latex bị rơi \sqrt/\root => HARD rebuild
+    if (SQRT_MATHML_RE.test(norm) && !/\\sqrt\b|\\root\b/.test(out)) {
+      const hard = hardSqrtFromMathML(norm);
+      if (hard) out = hard;
+    }
+
+    return String(out || "").replace(/\s+/g, " ").trim();
   } catch {
     return "";
   }
@@ -870,10 +1039,7 @@ function attachSectionOrderToQuestions(exam, sections) {
 }
 
 /* ================= ✅ FIX UI: BUILD BLOCKS (SECTION + QUESTION) đúng thứ tự ================= */
-/**
- * Nếu frontend render `sections` riêng ở đầu trang => sẽ bị như ảnh của bạn.
- * => Tạo `blocks` đã TRỘN sẵn để frontend chỉ render theo blocks.
- */
+
 function buildOrderedBlocks(exam) {
   const blocks = [];
   let lastSec = null;
