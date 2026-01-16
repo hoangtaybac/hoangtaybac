@@ -114,20 +114,45 @@ async function maybeConvertEmfWmfToPng(buf, filename) {
 
 /**
  * scan MathML embedded directly in OLE (nhanh)
+ * now tries utf8, utf16le, utf16be
  */
 function extractMathMLFromOleScan(buf) {
-  const utf8 = buf.toString("utf8");
-  let i = utf8.indexOf("<math");
-  if (i !== -1) {
-    let j = utf8.indexOf("</math>", i);
-    if (j !== -1) return utf8.slice(i, j + 7);
-  }
+  const candidates = [];
+  try {
+    candidates.push(buf.toString("utf8"));
+  } catch {}
+  try {
+    candidates.push(buf.toString("utf16le"));
+  } catch {}
+  try {
+    // thử cả utf16be (nhiều OLE dùng BE)
+    const be = Buffer.from(buf);
+    // swap bytes to approximate utf16be if needed
+    for (let i = 0; i + 1 < be.length; i += 2) {
+      const a = be[i];
+      be[i] = be[i + 1];
+      be[i + 1] = a;
+    }
+    candidates.push(be.toString("utf16le"));
+  } catch {}
 
-  const u16 = buf.toString("utf16le");
-  i = u16.indexOf("<math");
-  if (i !== -1) {
-    let j = u16.indexOf("</math>", i);
-    if (j !== -1) return u16.slice(i, j + 7);
+  for (const txt of candidates) {
+    if (!txt) continue;
+    const i = txt.indexOf("<math");
+    if (i !== -1) {
+      const j = txt.indexOf("</math>", i);
+      if (j !== -1) {
+        const slice = txt.slice(i, j + 7);
+        return slice;
+      }
+    }
+    // một số OLE có MathML bị escape (&lt;math ...), thử unescape nhanh
+    const unescaped = txt.replace(/&lt;/g, "<").replace(/&gt;/g, ">");
+    const iu = unescaped.indexOf("<math");
+    if (iu !== -1) {
+      const ju = unescaped.indexOf("</math>", iu);
+      if (ju !== -1) return unescaped.slice(iu, ju + 7);
+    }
   }
 
   return null;
@@ -135,6 +160,7 @@ function extractMathMLFromOleScan(buf) {
 
 /**
  * fallback: call ruby mt2mml.rb ole.bin -> MathML
+ * improved: use absolute script path, increase timeout & buffer, set LANG, run in script dir
  */
 function rubyOleToMathML(oleBuf) {
   return new Promise((resolve, reject) => {
@@ -142,18 +168,30 @@ function rubyOleToMathML(oleBuf) {
     const inPath = path.join(tmpDir, "oleObject.bin");
     fs.writeFileSync(inPath, oleBuf);
 
-    execFile(
-      "ruby",
-      ["mt2mml.rb", inPath],
-      { timeout: 30000, maxBuffer: 20 * 1024 * 1024 },
-      (err, stdout, stderr) => {
-        try {
-          fs.rmSync(tmpDir, { recursive: true, force: true });
-        } catch {}
-        if (err) return reject(new Error(stderr || err.message));
-        resolve(String(stdout || "").trim());
+    // absolute path to script (assumes mt2mml.rb sits next to this file)
+    const scriptPath = path.join(__dirname, "mt2mml.rb");
+
+    const opts = {
+      timeout: 120000, // 2 minutes
+      maxBuffer: 50 * 1024 * 1024, // 50 MB
+      env: Object.assign({}, process.env, { LANG: "en_US.UTF-8" }),
+      cwd: path.dirname(scriptPath),
+    };
+
+    execFile("ruby", [scriptPath, inPath], opts, (err, stdout, stderr) => {
+      try {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      } catch {}
+      if (err) {
+        console.error("[rubyOleToMathML] ruby exec error:", err && err.code, err && err.message);
+        if (stderr) console.error("[rubyOleToMathML] stderr:", String(stderr).slice(0, 4000));
+        if (stdout) console.error("[rubyOleToMathML] stdout:", String(stdout).slice(0, 4000));
+        return reject(new Error(stderr ? String(stderr).trim() : (err && err.message) || "ruby failed"));
       }
-    );
+      const out = String(stdout || "").trim();
+      if (!out) console.warn("[rubyOleToMathML] ruby returned empty stdout");
+      return resolve(out);
+    });
   });
 }
 
@@ -308,7 +346,7 @@ function fixSqrtLatex(latex, mathmlMaybe = "") {
 
   // 1) nếu có ký tự căn unicode => đổi dạng \sqrt{...} (đoán theo ngoặc)
   // √(x+1) => \sqrt{x+1}
-  s = s.replace(/√\s*\(\s*([\s\S]*?)\s*\)/g, "\\sqrt{$1}");
+  s = s.replace(/��\s*\(\s*([\s\S]*?)\s*\)/g, "\\sqrt{$1}");
   // √x => \sqrt{x} (chỉ 1 token đơn)
   s = s.replace(/√\s*([A-Za-z0-9]+)\b/g, "\\sqrt{$1}");
 
@@ -383,57 +421,76 @@ async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
 
   await Promise.all(
     Object.entries(found).map(async ([key, info]) => {
-      const oleFull = normalizeTargetToWordPath(info.oleTarget);
-      const oleBuf = await getZipEntryBuffer(zipFiles, oleFull);
-
-      // 1) try scan MathML inside OLE
-      let mml = "";
-      if (oleBuf) mml = extractMathMLFromOleScan(oleBuf) || "";
-
-      // 2) fallback ruby convert (MTEF inside OLE)
-      if (!mml && oleBuf) {
-        try {
-          mml = await rubyOleToMathML(oleBuf);
-        } catch {
-          mml = "";
+      try {
+        const oleFull = normalizeTargetToWordPath(info.oleTarget);
+        console.log(`[tokenizeMathType] key=${key} oleTarget=${oleFull} previewRid=${info.previewRid}`);
+        const oleBuf = await getZipEntryBuffer(zipFiles, oleFull);
+        if (!oleBuf) {
+          console.warn(`[tokenizeMathType] no ole buffer for key=${key}`);
+        } else {
+          console.log(`[tokenizeMathType] oleBuf.length=${oleBuf.length} for key=${key}`);
         }
-      }
 
-      // 3) MathML -> LaTeX (✅ có postprocess căn/cases)
-      const latex = mml ? mathmlToLatexSafe(mml) : "";
-      if (latex) {
-        latexMap[key] = latex;
-        return;
-      }
+        // 1) try scan MathML inside OLE
+        let mml = "";
+        if (oleBuf) {
+          mml = extractMathMLFromOleScan(oleBuf) || "";
+          if (mml) console.log(`[tokenizeMathType] extracted MathML (scan) len=${mml.length} for key=${key}`);
+        }
 
-      // 4) If no latex, fallback to preview image (convert emf/wmf->png)
-      if (info.previewRid) {
-        const t = rels.get(info.previewRid);
-        if (t) {
-          const imgFull = normalizeTargetToWordPath(t);
-          const imgBuf = await getZipEntryBuffer(zipFiles, imgFull);
-          if (imgBuf) {
-            const mime = guessMimeFromFilename(imgFull);
-            if (mime === "image/emf" || mime === "image/wmf") {
-              try {
-                const pngBuf = await maybeConvertEmfWmfToPng(imgBuf, imgFull);
-                if (pngBuf) {
-                  images[`fallback_${key}`] = `data:image/png;base64,${pngBuf.toString(
-                    "base64"
-                  )}`;
-                  latexMap[key] = "";
-                  return;
-                }
-              } catch {}
-            }
-            images[`fallback_${key}`] = `data:${mime};base64,${imgBuf.toString(
-              "base64"
-            )}`;
+        // 2) fallback ruby convert (MTEF inside OLE)
+        if (!mml && oleBuf) {
+          try {
+            console.log(`[tokenizeMathType] calling ruby mt2mml for key=${key}`);
+            mml = await rubyOleToMathML(oleBuf);
+            if (mml) console.log(`[tokenizeMathType] ruby produced MathML len=${mml.length} for key=${key}`);
+          } catch (e) {
+            console.warn(`[tokenizeMathType] ruby conversion failed for key=${key}: ${e && e.message}`);
+            mml = "";
           }
         }
-      }
 
-      latexMap[key] = "";
+        // 3) MathML -> LaTeX (✅ có postprocess căn/cases)
+        const latex = mml ? mathmlToLatexSafe(mml) : "";
+        if (latex) {
+          latexMap[key] = latex;
+          return;
+        }
+
+        // 4) If no latex, fallback to preview image (convert emf/wmf->png)
+        if (info.previewRid) {
+          const t = rels.get(info.previewRid);
+          if (t) {
+            const imgFull = normalizeTargetToWordPath(t);
+            const imgBuf = await getZipEntryBuffer(zipFiles, imgFull);
+            if (imgBuf) {
+              const mime = guessMimeFromFilename(imgFull);
+              if (mime === "image/emf" || mime === "image/wmf") {
+                try {
+                  const pngBuf = await maybeConvertEmfWmfToPng(imgBuf, imgFull);
+                  if (pngBuf) {
+                    images[`fallback_${key}`] = `data:image/png;base64,${pngBuf.toString(
+                      "base64"
+                    )}`;
+                    latexMap[key] = "";
+                    console.log(`[tokenizeMathType] fallback image converted emf/wmf -> png for key=${key}`);
+                    return;
+                  }
+                } catch (e) {
+                  console.warn(`[tokenizeMathType] inkscape convert error for key=${key}: ${e && e.message}`);
+                }
+              }
+              images[`fallback_${key}`] = `data:${mime};base64,${imgBuf.toString("base64")}`;
+              console.log(`[tokenizeMathType] using preview image for key=${key} mime=${mime}`);
+            }
+          }
+        }
+
+        latexMap[key] = "";
+      } catch (err) {
+        console.error(`[tokenizeMathType] unexpected error for key=${key}:`, err && err.message);
+        latexMap[key] = "";
+      }
     })
   );
 
@@ -593,7 +650,8 @@ function normalizeUnderlinedMarkersForSplit(s) {
 
 function findSolutionMarkerIndex(text, fromIndex = 0) {
   const s = String(text || "");
-  const re = /(Lời\s*giải|Giải\s*chi\s*tiết|Hướng\s*dẫn\s*giải)/i;
+  const re =
+    /(Lời\s*giải|Giải\s*chi\s*tiết|Hướng\s*dẫn\s*giải)/i;
   const sub = s.slice(fromIndex);
   const m = re.exec(sub);
   if (!m) return -1;
@@ -698,33 +756,25 @@ function splitStatementsTextabcd(blockText) {
  * - short: stem + boxes + solution/detail
  *
  * Đồng thời vẫn trả thêm "questions" cũ để bạn không bị vỡ front cũ.
- *
- * ✅ FIX: GIỮ TIÊU ĐỀ "PHẦN ..." và gắn vào từng câu -> field `section`
  */
 function parseExamFromText(text) {
-  const s = String(text || "").replace(/\r/g, "");
-  const lines = s.split("\n");
+  const blocks = String(text || "").split(/(?=Câu\s+\d+\.)/);
+  const exam = { version: 9, questions: [] };
 
-  const exam = { version: 10, questions: [] };
+  for (const block of blocks) {
+    if (!/^Câu\s+\d+\./i.test(block)) continue;
 
-  let currentSection = null; // ✅ tiêu đề PHẦN hiện tại
-  let buffer = "";
-
-  const flushQuestionBlock = (block) => {
-    const b = String(block || "").trim();
-    if (!/^Câu\s+\d+\./i.test(b)) return;
-
-    const qnoMatch = b.match(/^Câu\s+(\d+)\./i);
+    const qnoMatch = block.match(/^Câu\s+(\d+)\./i);
     const no = qnoMatch ? Number(qnoMatch[1]) : null;
 
-    const under = extractUnderlinedKeys(b);
-    const plain = stripTagsToPlain(b);
+    const under = extractUnderlinedKeys(block);
+    const plain = stripTagsToPlain(block);
 
     const isMCQ = detectHasMCQ(plain);
     const isTF4 = !isMCQ && detectHasTF4(plain);
 
     if (isMCQ) {
-      const parts = splitChoicesTextABCD(b);
+      const parts = splitChoicesTextABCD(block);
       const tail = parts?.tail || "";
       const solParts = splitSolutionSections(tail);
 
@@ -732,9 +782,8 @@ function parseExamFromText(text) {
 
       exam.questions.push({
         no,
-        section: currentSection, // ✅ thêm PHẦN
         type: "mcq",
-        stem: cleanStemFromQuestionNo(parts?.stem || b),
+        stem: cleanStemFromQuestionNo(parts?.stem || block),
         choices: {
           A: parts?.choices?.A || "",
           B: parts?.choices?.B || "",
@@ -746,11 +795,11 @@ function parseExamFromText(text) {
         detail: solParts.detail || "",
         _plain: plain,
       });
-      return;
+      continue;
     }
 
     if (isTF4) {
-      const parts = splitStatementsTextabcd(b);
+      const parts = splitStatementsTextabcd(block);
       const tail = parts?.tail || "";
       const solParts = splitSolutionSections(tail);
 
@@ -761,9 +810,8 @@ function parseExamFromText(text) {
 
       exam.questions.push({
         no,
-        section: currentSection, // ✅ thêm PHẦN
         type: "tf4",
-        stem: cleanStemFromQuestionNo(parts?.stem || b),
+        stem: cleanStemFromQuestionNo(parts?.stem || block),
         statements: {
           a: parts?.statements?.a || "",
           b: parts?.statements?.b || "",
@@ -775,18 +823,18 @@ function parseExamFromText(text) {
         detail: solParts.detail || "",
         _plain: plain,
       });
-      return;
+      continue;
     }
 
     // short / tự luận
-    const solIdx = findSolutionMarkerIndex(b, 0);
-    const stemPart = solIdx >= 0 ? b.slice(0, solIdx).trim() : b.trim();
-    const tailPart = solIdx >= 0 ? b.slice(solIdx).trim() : "";
+    const solIdx = findSolutionMarkerIndex(block, 0);
+    const stemPart = solIdx >= 0 ? block.slice(0, solIdx).trim() : block.trim();
+    const tailPart = solIdx >= 0 ? block.slice(solIdx).trim() : "";
+
     const solParts = splitSolutionSections(tailPart);
 
     exam.questions.push({
       no,
-      section: currentSection, // ✅ thêm PHẦN
       type: "short",
       stem: cleanStemFromQuestionNo(stemPart),
       boxes: 4,
@@ -794,31 +842,8 @@ function parseExamFromText(text) {
       detail: solParts.detail || "",
       _plain: plain,
     });
-  };
-
-  for (const line of lines) {
-    const t = line.trim();
-    if (!t) continue;
-
-    // ✅ gặp tiêu đề PHẦN -> lưu lại
-    if (/^PHẦN\s*\d+\./i.test(t)) {
-      flushQuestionBlock(buffer);
-      buffer = "";
-
-      currentSection = t; // giữ nguyên nội dung PHẦN
-      continue;
-    }
-
-    // bắt đầu 1 câu mới
-    if (/^Câu\s+\d+\./i.test(t)) {
-      flushQuestionBlock(buffer);
-      buffer = t + "\n";
-    } else {
-      buffer += t + "\n";
-    }
   }
 
-  flushQuestionBlock(buffer);
   return exam;
 }
 
@@ -878,7 +903,7 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     // 3) text ✅ giữ token + underline
     const text = wordXmlToTextKeepTokens(docXml);
 
-    // 4) NEW: parse exam output (mcq/tf4/short) ✅ giờ có section=PHẦN...
+    // 4) NEW: parse exam output (mcq/tf4/short)
     const exam = parseExamFromText(text);
 
     // 5) legacy questions output (mcq only) for backward compatibility
