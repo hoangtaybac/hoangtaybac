@@ -494,6 +494,229 @@ function mathmlToLatexSafe(mml) {
   }
 }
 
+
+// THÊM HÀM 
+function stripMathMLTagPrefixes(mathml) {
+  if (!mathml) return mathml;
+  let s = String(mathml);
+  s = s.replace(/<\s*\/\s*(m|mml|math)\s*:/gi, "</");
+  s = s.replace(/<\s*(m|mml|math)\s*:/gi, "<");
+  return s;
+}
+
+function ensureMathMLNamespace(mathml) {
+  if (!mathml) return mathml;
+  let s = String(mathml).replace(/<\?xml[^>]*\?>/gi, "").trim();
+  s = s.replace(
+    /<math(?![^>]*\bxmlns=)/i,
+    '<math xmlns="http://www.w3.org/1998/Math/MathML"'
+  );
+  return s;
+}
+
+function normalizeMtable(mathml) {
+  if (!mathml) return mathml;
+  return String(mathml).replace(/<mtable\b[^>]*>/gi, "<mtable>");
+}
+
+// ✅ menclose radical -> msqrt + mo √ -> msqrt
+function preprocessMathMLForSqrt(mathml) {
+  if (!mathml) return mathml;
+  let s = stripMathMLTagPrefixes(String(mathml));
+
+  s = s.replace(
+    /<menclose\b([^>]*)\bnotation\s*=\s*["']radical["']([^>]*)>([\s\S]*?)<\/menclose>/gi,
+    "<msqrt>$3</msqrt>"
+  );
+
+  const moSqrt =
+    String.raw`<mo>\s*(?:√|&#8730;|&#x221a;|&#x221A;|&radic;)\s*<\/mo>`;
+
+  s = s.replace(
+    new RegExp(moSqrt + String.raw`\s*<mrow>([\s\S]*?)<\/mrow>`, "gi"),
+    "<msqrt>$1</msqrt>"
+  );
+  s = s.replace(
+    new RegExp(moSqrt + String.raw`\s*<mi>([^<]+)<\/mi>`, "gi"),
+    "<msqrt><mi>$1</mi></msqrt>"
+  );
+  s = s.replace(
+    new RegExp(moSqrt + String.raw`\s*<mn>([^<]+)<\/mn>`, "gi"),
+    "<msqrt><mn>$1</mn></msqrt>"
+  );
+
+  return s;
+}
+
+/** ====== Helper: find balanced tag block <tag ...> ... </tag> ====== */
+function extractBalancedTagBlocks(xml, tagName) {
+  const blocks = [];
+  const openRe = new RegExp(`<${tagName}\\b[^>]*>`, "ig");
+  const closeRe = new RegExp(`</${tagName}>`, "ig");
+
+  let m;
+  while ((m = openRe.exec(xml)) !== null) {
+    const start = m.index;
+    const openLen = m[0].length;
+
+    let depth = 1;
+    let i = start + openLen;
+
+    while (depth > 0) {
+      const nextOpen = openRe.exec(xml);
+      const nextClose = closeRe.exec(xml);
+
+      const o = nextOpen ? nextOpen.index : Infinity;
+      const c = nextClose ? nextClose.index : Infinity;
+
+      if (c === Infinity) break; // malformed
+
+      if (o < c) {
+        depth++;
+        i = o + (nextOpen[0] ? nextOpen[0].length : 0);
+      } else {
+        depth--;
+        i = c + (nextClose[0] ? nextClose[0].length : 0);
+      }
+    }
+
+    const end = i;
+    if (end > start) {
+      blocks.push({ start, end, xml: xml.slice(start, end) });
+      // reset regex lastIndex to continue AFTER this block
+      openRe.lastIndex = start + 1;
+      closeRe.lastIndex = start + 1;
+    }
+  }
+
+  // sort by start
+  blocks.sort((a, b) => a.start - b.start);
+  return blocks;
+}
+
+/** Split direct children inside <mroot> ... </mroot> into [base, index] at top-level */
+function splitMrootChildren(innerXml) {
+  const s = innerXml.trim();
+  let depth = 0;
+  let cut = -1;
+
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] === "<") {
+      if (s.slice(i, i + 2) === "</") depth--;
+      else if (s.slice(i, i + 5).toLowerCase() === "<mrow") depth++;
+      else if (s.slice(i, i + 3).toLowerCase() === "<mi") depth++;
+      else if (s.slice(i, i + 3).toLowerCase() === "<mn") depth++;
+      else if (s.slice(i, i + 3).toLowerCase() === "<mo") depth++;
+      else if (s.slice(i, i + 6).toLowerCase() === "<msqrt") depth++;
+      else if (s.slice(i, i + 6).toLowerCase() === "<mroot") depth++;
+      else if (s.slice(i, i + 9).toLowerCase() === "<menclose") depth++;
+      // NOTE: heuristic; enough for MathML from mt2mml
+    }
+
+    // find boundary between first and second child: when depth returns to 0 after first element closes
+    if (depth === 0 && i > 0) {
+      const maybe = s.slice(0, i + 1);
+      if (/<\/\w+>\s*$/.test(maybe)) {
+        cut = i + 1;
+        break;
+      }
+    }
+  }
+
+  if (cut < 0) return [s, ""];
+  const a = s.slice(0, cut).trim();
+  const b = s.slice(cut).trim();
+  return [a, b];
+}
+
+/**
+ * ✅ Core: Replace all <msqrt>/<mroot> blocks by tokens BEFORE MathMLToLaTeX.convert
+ * then restore tokens into \sqrt{...} / \sqrt[n]{...}
+ */
+function convertMathMLWithSqrtTokens(mathml) {
+  let mm = stripMathMLTagPrefixes(String(mathml || "")).trim();
+
+  // wrap if body-only
+  const hasMathTag = /<\s*math\b/i.test(mm);
+  const looksLikeBody = /<(mrow|mi|mn|mo|msqrt|mroot|mfrac|msup|msub|msubsup|menclose)\b/i.test(mm);
+  if (!hasMathTag && looksLikeBody) {
+    mm = `<math xmlns="http://www.w3.org/1998/Math/MathML">${mm}</math>`;
+  }
+  if (!/<\s*math\b/i.test(mm)) return "";
+
+  mm = ensureMathMLNamespace(mm);
+  mm = normalizeMtable(mm);
+  mm = preprocessMathMLForSqrt(mm);
+
+  // extract blocks
+  const sqrtBlocks = extractBalancedTagBlocks(mm, "msqrt");
+  const rootBlocks = extractBalancedTagBlocks(mm, "mroot");
+
+  const tokenMap = []; // { token, type, xml }
+  let replaced = mm;
+
+  // replace from back to front to keep indices valid
+  const all = [
+    ...sqrtBlocks.map(b => ({ ...b, type: "msqrt" })),
+    ...rootBlocks.map(b => ({ ...b, type: "mroot" })),
+  ].sort((a, b) => b.start - a.start);
+
+  let k = 0;
+  for (const b of all) {
+    const token = `__SQRT_TOKEN_${++k}__`;
+    tokenMap.push({ token, type: b.type, xml: b.xml });
+
+    // replace whole block with a harmless identifier node
+    replaced =
+      replaced.slice(0, b.start) +
+      `<mi>${token}</mi>` +
+      replaced.slice(b.end);
+  }
+
+  // convert the big expression (sqrt removed)
+  let latexMain = "";
+  try {
+    latexMain = (MathMLToLaTeX.convert(replaced) || "").trim();
+  } catch {
+    latexMain = "";
+  }
+
+  // restore each token with manual sqrt/root conversion
+  for (const item of tokenMap) {
+    let latexRep = "";
+
+    if (item.type === "msqrt") {
+      const inner = item.xml
+        .replace(/^<msqrt\b[^>]*>/i, "")
+        .replace(/<\/msqrt>\s*$/i, "");
+      const innerLatex = convertMathMLWithSqrtTokens(
+        `<math xmlns="http://www.w3.org/1998/Math/MathML">${inner}</math>`
+      );
+      latexRep = `\\sqrt{${innerLatex || ""}}`;
+    } else {
+      const inner = item.xml
+        .replace(/^<mroot\b[^>]*>/i, "")
+        .replace(/<\/mroot>\s*$/i, "");
+      const [baseXml, indexXml] = splitMrootChildren(inner);
+
+      const baseLatex = convertMathMLWithSqrtTokens(
+        `<math xmlns="http://www.w3.org/1998/Math/MathML">${baseXml}</math>`
+      );
+      const idxLatex = convertMathMLWithSqrtTokens(
+        `<math xmlns="http://www.w3.org/1998/Math/MathML">${indexXml}</math>`
+      );
+      latexRep = `\\sqrt[${idxLatex || ""}]{${baseLatex || ""}}`;
+    }
+
+    // replace token in latex output
+    // token appears as plain text (because it was in <mi>)
+    const re = new RegExp(item.token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g");
+    latexMain = latexMain.replace(re, latexRep);
+  }
+
+  return latexMain.trim();
+}
+
 /* ================= MathType FIRST ================= */
 
 async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
