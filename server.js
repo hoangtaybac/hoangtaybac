@@ -2,8 +2,9 @@
 // ✅ FULL CODE (FIX triệt để mất căn thức trong MathType OLE của CAN THUC.docx)
 // - FIX: OLE scan bắt được cả <math> và <m:math>
 // - FIX: normalize MathML (strip m: prefix + menclose radical -> msqrt + mo √ -> msqrt)
-// - FIX: tokenize ALL msqrt/mroot -> placeholder, convert, rồi rebuild \sqrt/\sqrt[n]{}
-// - FIX: restore token robust (token bị tách ký tự + nằm trong \text/\mathrm/\operatorname hoặc trần)
+// - FIX: tách riêng biểu thức có căn => chạy pipeline radical-safe
+// - FIX: tokenize ALL msqrt/mroot -> token (dùng <mi> + token không underscore), convert, rồi rebuild \sqrt/\sqrt[n]{}
+// - FIX: restore token robust (token bị tách ký tự + wrapper \text/\mathrm/\operatorname/...)
 // - Giữ nguyên thuật toán parse PHẦN/Câu/underline/blocks của bạn
 //
 // Chạy: node server.js
@@ -316,9 +317,16 @@ function postProcessLatex(latex, mathmlMaybe = "") {
   return String(s || "").replace(/\s+/g, " ").trim();
 }
 
-/* ================= ✅ RADICAL FIX (Normalize + Tokenize msqrt/mroot) ================= */
+/* ================= ✅ RADICAL FIX (Quét căn + xử lý riêng) ================= */
 
-// ✅ NEW: helpers for robust token restore
+const RADICAL_MML_RE =
+  /(<\s*msqrt\b|<\s*mroot\b|menclose\b[^>]*notation\s*=\s*["']radical["']|√|&#8730;|&#x221a;|&#x221A;|&radic;)/i;
+
+function hasRadicalInMathML(mml = "") {
+  return RADICAL_MML_RE.test(String(mml || ""));
+}
+
+// Robust token matching helpers
 function escapeRegExp(s) {
   return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -330,24 +338,20 @@ function spacedTokenPattern(token) {
 }
 function tokenRegex(token) {
   const p = spacedTokenPattern(token);
-  return new RegExp(
-    [
-      `\\\\text\\s*\\{\\s*${p}\\s*\\}`,
-      `\\\\mathrm\\s*\\{\\s*${p}\\s*\\}`,
-      `\\\\operatorname\\s*\\{\\s*${p}\\s*\\}`,
-      `${p}`,
-    ].join("|"),
-    "g"
-  );
+  const wrappers = ["text", "mathrm", "mathbf", "mathit", "operatorname"];
+  const wrapped = wrappers
+    .map((w) => `\\\\${w}\\s*\\{\\s*${p}\\s*\\}`)
+    .join("|");
+  return new RegExp(`(${wrapped}|${p})`, "g");
 }
 
 function normalizeMathML(mml = "") {
   let s = String(mml || "");
 
-  // <m:msqrt> -> <msqrt>, </m:msqrt> -> </msqrt>
+  // strip namespace prefix in tags: <m:msqrt> -> <msqrt>
   s = s.replace(/<\s*(\/?)\s*([A-Za-z0-9_]+):/g, "<$1");
 
-  // m:attr="..." -> attr="..."
+  // strip namespace prefix in attributes: m:val=".." -> val=".."
   s = s.replace(/(\s)[A-Za-z0-9_]+:([A-Za-z0-9_\-]+)=/g, "$1$2=");
 
   // menclose radical => msqrt
@@ -357,14 +361,19 @@ function normalizeMathML(mml = "") {
   );
   s = s.replace(/<\s*\/\s*menclose\s*>/gi, "</msqrt>");
 
-  // Some MathType variants omit notation
+  // some variants omit notation but still use menclose
   s = s.replace(/<\s*menclose\b[^>]*>/gi, "<msqrt>");
 
-  // ✅ NEW: mo √ + mrow ... => msqrt(mrow ...)
-  // covers: √, &#8730; &#x221A; &radic;
+  // variant: <mo>√</mo><mrow>...</mrow> => <msqrt><mrow>...</mrow></msqrt>
   s = s.replace(
     /<\s*mo\b[^>]*>\s*(?:√|&#8730;|&#x221a;|&#x221A;|&radic;)\s*<\s*\/\s*mo\s*>\s*<\s*mrow\b[^>]*>([\s\S]*?)<\s*\/\s*mrow\s*>/gi,
     "<msqrt><mrow>$1</mrow></msqrt>"
+  );
+
+  // variant: <mo>√</mo> followed by ANY single element => wrap it
+  s = s.replace(
+    /<\s*mo\b[^>]*>\s*(?:√|&#8730;|&#x221a;|&#x221A;|&radic;)\s*<\s*\/\s*mo\s*>\s*(<\s*(?:mi|mn|mrow|mfenced|msup|msub|msubsup|mfrac|msqrt|mroot)\b[\s\S]*?<\/\s*(?:mi|mn|mrow|mfenced|msup|msub|msubsup|mfrac|msqrt|mroot)\s*>)/gi,
+    "<msqrt>$1</msqrt>"
   );
 
   return s;
@@ -449,19 +458,19 @@ function tokenizeRadicals(normMathML) {
   for (;;) {
     const blk = extractTagBlock(s, "msqrt", 0);
     if (!blk) break;
-    const token = `__SQRT${i++}__`;
+    const token = `ZZSQRT${i++}ZZ`; // ✅ no underscore
     map[token] = { kind: "sqrt", inner: blk.inner };
-    s = s.slice(0, blk.start) + `<mtext>${token}</mtext>` + s.slice(blk.end);
+    s = s.slice(0, blk.start) + `<mi>${token}</mi>` + s.slice(blk.end);
   }
 
   // tokenize all mroot
   for (;;) {
     const blk = extractTagBlock(s, "mroot", 0);
     if (!blk) break;
-    const token = `__ROOT${i++}__`;
+    const token = `ZZROOT${i++}ZZ`;
     const kids = splitTopLevelChildren(blk.inner);
     map[token] = { kind: "root", base: kids[0] || "", idx: kids[1] || "" };
-    s = s.slice(0, blk.start) + `<mtext>${token}</mtext>` + s.slice(blk.end);
+    s = s.slice(0, blk.start) + `<mi>${token}</mi>` + s.slice(blk.end);
   }
 
   return { mml: s, map };
@@ -472,14 +481,21 @@ function mathmlToLatexSafe(mml) {
     if (!mml || !String(mml).includes("math")) return "";
 
     const norm = normalizeMathML(mml);
+    const doRadicalSafe = hasRadicalInMathML(norm);
 
-    // ✅ tokenize radicals => converter không thể làm rơi dấu căn
+    // ✅ không có căn -> convert bình thường
+    if (!doRadicalSafe) {
+      let latex = (MathMLToLaTeX.convert(norm) || "").trim();
+      latex = postProcessLatex(latex, norm);
+      return String(latex || "").replace(/\s+/g, " ").trim();
+    }
+
+    // ✅ có căn -> tokenize -> convert -> rebuild
     const { mml: tokMml, map } = tokenizeRadicals(norm);
 
     let latex = (MathMLToLaTeX.convert(tokMml) || "").trim();
     latex = postProcessLatex(latex, tokMml);
 
-    // ✅ NEW: Replace tokens back robust (token tách ký tự + wrappers)
     for (const [token, info] of Object.entries(map)) {
       let repl = "";
 
