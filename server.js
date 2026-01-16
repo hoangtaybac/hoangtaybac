@@ -5,7 +5,7 @@
 // - ✅ NEW: Giữ được bảng <w:tbl> và nội dung trong bảng (kể cả underline + token math/img)
 //
 // ✅ FIX MẤT CĂN THỨC (MathType OLE) — BẢN CHẮC ĂN:
-// 1) OLE scan bắt cả <math> và <m:math>
+// 1) OLE scan bắt cả <math> và <m:math> (mở rộng bắt mọi prefix)
 // 2) normalize MathML: strip namespace prefix (GIỮ </...>), menclose radical -> msqrt, mo √ -> msqrt
 // 3) tokenize msqrt bằng token CHỈ chữ+số + bọc <mtext> (converter ít phá), rồi rebuild \sqrt{...}
 // 4) hard-last-resort: nếu MathML có căn mà LaTeX không có \sqrt/\root => wrap \sqrt{...}
@@ -131,43 +131,38 @@ async function maybeConvertEmfWmfToPng(buf, filename) {
 
 /* ================= MathType OLE -> MathML -> LaTeX ================= */
 
-// ✅ FIX 1: OLE scan bắt cả <math> và <m:math>
+// ✅ FIX 1: OLE scan bắt cả <math> và <m:math> (mở rộng bắt mọi prefix)
 function extractMathMLFromOleScan(buf) {
-  const tryExtract = (s) => {
+  const tryExtractFromString = (s) => {
     if (!s) return null;
-
-    const idxMath = s.search(/<math\b/i);
-    const idxMMath = s.search(/<m:math\b/i);
-
-    let i = -1;
-    let close = "";
-
-    if (idxMath !== -1 && (idxMMath === -1 || idxMath < idxMMath)) {
-      i = idxMath;
-      close = "</math>";
-    } else if (idxMMath !== -1) {
-      i = idxMMath;
-      close = "</m:math>";
-    } else {
-      return null;
-    }
-
-    const lower = s.toLowerCase();
-    const j = lower.indexOf(close, i);
-    if (j !== -1) return s.slice(i, j + close.length);
-
-    // fallback: open <m:math> nhưng close </math> (hiếm)
-    const j2 = lower.indexOf("</math>", i);
-    if (j2 !== -1) return s.slice(i, j2 + 7);
-
+    // remove embedded nulls that appear in some UTF-16 dumps (helps regex)
+    const clean = s.replace(/\0/g, "");
+    // match <(prefix:)math ...> ... </(prefix:)math> robust to any prefix
+    const m = clean.match(
+      /<(?:(?:[A-Za-z0-9_-]+):)?math\b[^>]*>[\s\S]*?<\/(?:(?:[A-Za-z0-9_-]+):)?math>/i
+    );
+    if (m) return m[0];
     return null;
   };
 
-  let out = tryExtract(buf.toString("utf8"));
-  if (out) return out;
-
-  out = tryExtract(buf.toString("utf16le"));
-  if (out) return out;
+  try {
+    // try common encodings
+    let out = tryExtractFromString(buf.toString("utf8"));
+    if (out) return out;
+    out = tryExtractFromString(buf.toString("utf16le"));
+    if (out) return out;
+    out = tryExtractFromString(buf.toString("latin1"));
+    if (out) return out;
+  } catch {
+    // fallback: best-effort convert buffer to string then strip nulls
+    try {
+      const s = String(buf).replace(/\0/g, "");
+      const m = s.match(
+        /<(?:(?:[A-Za-z0-9_-]+):)?math\b[^>]*>[\s\S]*?<\/(?:(?:[A-Za-z0-9_-]+):)?math>/i
+      );
+      if (m) return m[0];
+    } catch {}
+  }
 
   return null;
 }
@@ -198,30 +193,32 @@ function normalizeMathMLForConvert(mml) {
   let s = String(mml || "");
   s = s.replace(/\r\n/g, "\n");
 
-  // strip namespace prefix trong tên thẻ nhưng GIỮ </...>
-  // <m:math> -> <math>, </m:math> -> </math>, <o:...> -> <...>
-  s = s.replace(/<(\/?)([a-zA-Z0-9]+):/g, "<$1");
+  // Remove namespace prefixes on tags: <m:math> -> <math>, </m:math> -> </math>
+  // tolerate whitespace like < m : tag >
+  s = s.replace(/<\s*(\/?)\s*([A-Za-z0-9_-]+):/g, "<$1");
 
-  // menclose notation="radical" -> msqrt (lặp để xử lý nested)
+  // menclose notation="radical" OR notation='radical' OR notation="radical something"
   const reRad =
-    /<menclose\b[^>]*\bnotation\s*=\s*"(?:radical|radical\s+\w+|\w+\s+radical)"[^>]*>([\s\S]*?)<\/menclose>/gi;
-  while (reRad.test(s)) s = s.replace(reRad, "<msqrt>$1</msqrt>");
+    /<menclose\b[^>]*\bnotation\s*=\s*['"]?([^'"]*radical[^'"]*)['"]?[^>]*>([\s\S]*?)<\/menclose>/gi;
+  s = s.replace(reRad, "<msqrt>$2</msqrt>");
 
-  // entity √
-  s = s.replace(/&radic;|&#8730;|&#x221a;|&#x221A;/g, "√");
+  // Also normalize explicit <mroot> (leave as-is) and handle &radic; entities -> literal
+  s = s.replace(/&radic;|&#8730;|&#x221a;|&#x221A;/gi, "√");
 
-  // pattern phổ biến: <mo>√</mo> + (mrow/mi/mn) -> msqrt
+  // Replace pattern: <mo>√</mo> followed by a base -> msqrt
   const reMoSqrt =
-    /<mo>\s*√\s*<\/mo>\s*(<mrow>[\s\S]*?<\/mrow>|<mi>[\s\S]*?<\/mi>|<mn>[\s\S]*?<\/mn>)/gi;
-  while (reMoSqrt.test(s)) s = s.replace(reMoSqrt, "<msqrt>$1</msqrt>");
+    /<mo\b[^>]*>\s*√\s*<\/mo>\s*(<mroot\b[^>]*>[\s\S]*?<\/mroot>|<mrow>[\s\S]*?<\/mrow>|<mi>[\s\S]*?<\/mi>|<mn>[\s\S]*?<\/mn>)/gi;
+  s = s.replace(reMoSqrt, "<msqrt>$1</msqrt>");
 
   return s;
 }
 
-// ✅ FIX 3: tokenize msqrt bằng token CHỈ chữ+số + bọc <mtext>
+// ✅ FIX 3: tokenize msqrt bằng token CHỈ chữ+số + bọc <mtext> (converter ít phá)
+// --- REPLACEMENT: tokenizeMsqrtBlocks (handles msqrt + mroot) ---
 function tokenizeMsqrtBlocks(mathml) {
   const s0 = String(mathml || "");
-  const re = /<\/?msqrt\b[^>]*>/gi;
+  // match both msqrt and mroot opening/closing tags (after normalize namespace)
+  const re = /<\/?(?:msqrt|mroot)\b[^>]*>/gi;
 
   const stack = [];
   const blocks = [];
@@ -231,7 +228,7 @@ function tokenizeMsqrtBlocks(mathml) {
     const tag = m[0];
     const isClose = tag.startsWith("</");
     if (!isClose) {
-      stack.push({ openStart: m.index, openEnd: re.lastIndex });
+      stack.push({ openStart: m.index, openEnd: re.lastIndex, tagStartRaw: tag });
     } else {
       const open = stack.pop();
       if (!open) continue;
@@ -246,7 +243,7 @@ function tokenizeMsqrtBlocks(mathml) {
 
   if (!blocks.length) return { out: s0, tokens: [] };
 
-  // replace từ back -> front để index không lệch
+  // replace from back to front to preserve indices
   blocks.sort((a, b) => b.openStart - a.openStart);
 
   let out = s0;
@@ -254,14 +251,11 @@ function tokenizeMsqrtBlocks(mathml) {
 
   let k = 1;
   for (const b of blocks) {
-    const token = `SQRTTOKEN${k++}X`; // ✅ không underscore
+    const token = `SQRTTOKEN${k++}X`;
     const inner = out.slice(b.openEnd, b.closeStart);
     tokens.push({ token, inner });
 
-    out =
-      out.slice(0, b.openStart) +
-      `<mtext>${token}</mtext>` +
-      out.slice(b.closeEnd);
+    out = out.slice(0, b.openStart) + `<mtext>${token}</mtext>` + out.slice(b.closeEnd);
   }
 
   return { out, tokens };
@@ -442,9 +436,14 @@ function mathmlToLatexSafe(mml, _depth = 0) {
     const hasRadical =
       /(msqrt|mroot|√|&radic;|&#8730;|&#x221a;|&#x221A;)/i.test(m);
 
-    // tokenize msqrt
+    // tokenize msqrt / mroot
     const tok = tokenizeMsqrtBlocks(m);
-    const mTok = tok.out;
+    let mTok = tok.out;
+
+    // ensure a proper math namespace so converter behaves consistently
+    if (!/xmlns\s*=/i.test(mTok)) {
+      mTok = mTok.replace(/<math(\b[^>]*)>/i, '<math xmlns="http://www.w3.org/1998/Math/MathML"$1>');
+    }
 
     let latex0 = (MathMLToLaTeX.convert(mTok) || "").trim();
     latex0 = postProcessLatex(latex0, mTok);
@@ -470,7 +469,11 @@ function mathmlToLatexSafe(mml, _depth = 0) {
       if (canRecurse) {
         innerLatex = mathmlToLatexSafe(innerMath, depth + 1);
       } else {
-        innerLatex = (MathMLToLaTeX.convert(normalizeMathMLForConvert(innerMath)) || "").trim();
+        let tmp = normalizeMathMLForConvert(innerMath);
+        if (!/xmlns\s*=/i.test(tmp)) {
+          tmp = tmp.replace(/<math(\b[^>]*)>/i, '<math xmlns="http://www.w3.org/1998/Math/MathML"$1>');
+        }
+        innerLatex = (MathMLToLaTeX.convert(tmp) || "").trim();
         innerLatex = postProcessLatex(innerLatex, innerMath);
       }
 
