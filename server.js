@@ -4,15 +4,6 @@
 // - Server trả thêm `blocks` đã trộn (section + question) đúng thứ tự để frontend render chuẩn.
 // - ✅ NEW: Giữ được bảng <w:tbl> và nội dung trong bảng (kể cả underline + token math/img)
 //
-// ✅ FIX MẤT CĂN THỨC (MathType OLE):
-// - Normalize MathML: strip prefix m: / o: , decode entities, menclose radical -> msqrt
-// - Normalize "mo √ ..." -> msqrt wrap (các pattern thường gặp)
-// - HARD FIX: nếu MathML có căn mà LaTeX convert ra KHÔNG có \sqrt/\root => bọc \sqrt{...}
-//
-// ✅ FIX ẢNH KHÔNG TRẢ VỀ (Câu 7, Câu 11...):
-// - Bắt được cả <a:blip ...>...</a:blip> (không tự đóng), không chỉ <a:blip .../>
-// - Hỗ trợ cả r:embed và r:link (một số file Word dùng link)
-//
 // Chạy: node server.js
 // Yêu cầu: inkscape (convert emf/wmf), ruby + mt2mml.rb (fallback MathType)
 // npm i express multer unzipper cors mathml-to-latex
@@ -170,57 +161,9 @@ function rubyOleToMathML(oleBuf) {
   });
 }
 
-/* ================== ✅ MathML NORMALIZE (FIX MẤT CĂN) ================== */
-
-const SQRT_MATHML_RE =
-  /(msqrt|mroot|menclose[^>]*notation\s*=\s*["']radical["']|√|&#8730;|&#x221a;|&#x221A;|&radic;)/i;
-
-function stripMathmlNamespacePrefixes(mml) {
-  return String(mml || "")
-    .replace(/<\/\s*[a-zA-Z0-9_]+\s*:/g, "</")
-    .replace(/<\s*[a-zA-Z0-9_]+\s*:/g, "<");
-}
-
-function normalizeMencloseRadicalToMsqrt(mml) {
-  return String(mml || "").replace(
-    /<menclose\b([^>]*)\bnotation\s*=\s*["']radical["']([^>]*)>([\s\S]*?)<\/menclose>/gi,
-    (_m, a, b, inner) => `<msqrt>${inner}</msqrt>`
-  );
-}
-
-function normalizeMoRadicalToMsqrt(mml) {
-  const RAD = "(?:√|&#8730;|&#x221a;|&#x221A;|&radic;)";
-  const NEXT =
-    "(<mrow\\b[\\s\\S]*?<\\/mrow>|<mi\\b[\\s\\S]*?<\\/mi>|<mn\\b[\\s\\S]*?<\\/mn>|<msup\\b[\\s\\S]*?<\\/msup>|<msub\\b[\\s\\S]*?<\\/msub>|<msubsup\\b[\\s\\S]*?<\\/msubsup>|<mfrac\\b[\\s\\S]*?<\\/mfrac>|<msqrt\\b[\\s\\S]*?<\\/msqrt>|<mroot\\b[\\s\\S]*?<\\/mroot>)";
-
-  const re = new RegExp(
-    `<mo\\b[^>]*>\\s*${RAD}\\s*<\\/mo>\\s*${NEXT}`,
-    "gi"
-  );
-  return String(mml || "").replace(
-    re,
-    (_m, nextNode) => `<msqrt>${nextNode}</msqrt>`
-  );
-}
-
-function normalizeMathMLForConverter(mml) {
-  let s = String(mml || "").trim();
-  if (!s) return "";
-
-  s = decodeXmlEntities(s);
-  s = stripMathmlNamespacePrefixes(s);
-
-  if (!/<\s*math\b/i.test(s)) {
-    s = `<math xmlns="http://www.w3.org/1998/Math/MathML">${s}</math>`;
-  }
-
-  s = normalizeMencloseRadicalToMsqrt(s);
-  s = normalizeMoRadicalToMsqrt(s);
-
-  return s;
-}
-
 /* ================== LATEX POSTPROCESS ================== */
+
+const SQRT_MATHML_RE = /(msqrt|mroot|√|&#8730;|&#x221a;|&#x221A;|&radic;)/i;
 
 function sanitizeLatexStrict(latex) {
   if (!latex) return latex;
@@ -355,17 +298,16 @@ function fixPiecewiseFunction(latex) {
 }
 
 function fixSqrtLatex(latex, mathmlMaybe = "") {
-  let s = String(latex || "").trim();
+  let s = String(latex || "");
 
   s = s.replace(/√\s*\(\s*([\s\S]*?)\s*\)/g, "\\sqrt{$1}");
   s = s.replace(/√\s*([A-Za-z0-9]+)\b/g, "\\sqrt{$1}");
 
-  const mml = String(mathmlMaybe || "");
-  const hasRadicalInMml = SQRT_MATHML_RE.test(mml);
-  const hasSqrtInLatex = /\\sqrt\b|\\root\b/.test(s);
-
-  if (hasRadicalInMml && !hasSqrtInLatex && s) {
-    s = `\\sqrt{${s}}`;
+  if (SQRT_MATHML_RE.test(String(mathmlMaybe || ""))) {
+    const hasSqrt = /\\sqrt\b|\\root\b/.test(s);
+    if (!hasSqrt && s) {
+      s = s.replace(/\bradic\b/gi, "\\sqrt{}");
+    }
   }
 
   return s;
@@ -383,13 +325,9 @@ function postProcessLatex(latex, mathmlMaybe = "") {
 
 function mathmlToLatexSafe(mml) {
   try {
-    if (!mml) return "";
-
-    const norm = normalizeMathMLForConverter(mml);
-    if (!norm || !norm.includes("<math")) return "";
-
-    const latex0 = (MathMLToLaTeX.convert(norm) || "").trim();
-    return postProcessLatex(latex0, norm);
+    if (!mml || !mml.includes("<math")) return "";
+    const latex0 = (MathMLToLaTeX.convert(mml) || "").trim();
+    return postProcessLatex(latex0, mml);
   } catch {
     return "";
   }
@@ -411,9 +349,7 @@ async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
     if (!oleTarget) return block;
 
     const vmlRid = block.match(/<v:imagedata\b[^>]*\br:id="([^"]+)"[^>]*\/>/);
-    const blipRid = block.match(
-      /<a:blip\b[^>]*\br:embed="([^"]+)"[^>]*\/?>/ // allow non-self-close too
-    );
+    const blipRid = block.match(/<a:blip\b[^>]*\br:embed="([^"]+)"[^>]*\/>/);
     const previewRid = vmlRid?.[1] || blipRid?.[1] || null;
 
     const key = `mathtype_${++idx}`;
@@ -487,7 +423,6 @@ async function tokenizeImagesAfter(docXml, rels, zipFiles) {
   const jobs = [];
 
   const schedule = (rid, key) => {
-    if (!rid) return;
     const target = rels.get(rid);
     if (!target) return;
     const full = normalizeTargetToWordPath(target);
@@ -512,10 +447,8 @@ async function tokenizeImagesAfter(docXml, rels, zipFiles) {
     );
   };
 
-  // ✅ FIX: match BOTH <a:blip ...>...</a:blip> and <a:blip .../>
-  // and support r:embed + r:link (some docs use link)
   docXml = docXml.replace(
-    /<a:blip\b[^>]*\b(?:r:embed|r:link)="([^"]+)"[^>]*>[\s\S]*?<\/a:blip>/g,
+    /<a:blip\b[^>]*\br:embed="([^"]+)"[^>]*\/>/g,
     (m, rid) => {
       const key = `img_${++idx}`;
       schedule(rid, key);
@@ -523,16 +456,6 @@ async function tokenizeImagesAfter(docXml, rels, zipFiles) {
     }
   );
 
-  docXml = docXml.replace(
-    /<a:blip\b[^>]*\b(?:r:embed|r:link)="([^"]+)"[^>]*\/>/g,
-    (m, rid) => {
-      const key = `img_${++idx}`;
-      schedule(rid, key);
-      return `[!img:$${key}$]`;
-    }
-  );
-
-  // VML (old Word)
   docXml = docXml.replace(
     /<v:imagedata\b[^>]*\br:id="([^"]+)"[^>]*\/>/g,
     (m, rid) => {
@@ -551,8 +474,12 @@ async function tokenizeImagesAfter(docXml, rels, zipFiles) {
 function convertRunsToHtml(fragmentXml) {
   let frag = String(fragmentXml || "");
 
-  frag = frag.replace(/<w:tab\s*\/>/g, "\t").replace(/<w:br\s*\/>/g, "\n");
+  // Convert line breaks / tabs inside fragment
+  frag = frag
+    .replace(/<w:tab\s*\/>/g, "\t")
+    .replace(/<w:br\s*\/>/g, "\n");
 
+  // Convert each run while preserving underline
   frag = frag.replace(/<w:r\b[\s\S]*?<\/w:r>/g, (run) => {
     const hasU =
       /<w:u\b[^>]*\/>/.test(run) &&
@@ -570,9 +497,13 @@ function convertRunsToHtml(fragmentXml) {
     return hasU ? `<u>${inner}</u>` : inner;
   });
 
+  // Remove all other tags in fragment, keep <u>
   frag = frag.replace(/<(?!\/?u\b)[^>]+>/g, "");
+
+  // Decode entities
   frag = decodeXmlEntities(frag);
 
+  // Normalize
   frag = frag.replace(/\r/g, "");
   frag = frag.replace(/[ \t]+\n/g, "\n").trim();
   return frag;
@@ -613,9 +544,11 @@ function wordTableXmlToHtmlTable(tblXml) {
 function wordXmlToTextKeepTokens(docXml) {
   let x = String(docXml || "");
 
+  // Protect tokens BEFORE stripping tags
   x = x.replace(/\[!m:\$\$?(.*?)\$\$?\]/g, "___MATH_TOKEN___$1___END___");
   x = x.replace(/\[!img:\$\$?(.*?)\$\$?\]/g, "___IMG_TOKEN___$1___END___");
 
+  // ✅ Convert ALL <w:tbl> to HTML tables and keep them
   const tableMap = {};
   let tableIdx = 0;
 
@@ -630,6 +563,7 @@ function wordXmlToTextKeepTokens(docXml) {
     .replace(/<w:br\s*\/>/g, "\n")
     .replace(/<\/w:p>/g, "\n");
 
+  // Convert each run while preserving underline
   x = x.replace(/<w:r\b[\s\S]*?<\/w:r>/g, (run) => {
     const hasU =
       /<w:u\b[^>]*\/>/.test(run) &&
@@ -647,12 +581,15 @@ function wordXmlToTextKeepTokens(docXml) {
     return hasU ? `<u>${inner}</u>` : inner;
   });
 
+  // Remove remaining tags outside runs, but keep <u> + table tags
   x = x.replace(/<(?!\/?(u|table|tr|td|br)\b)[^>]+>/g, "");
 
+  // Restore tables
   for (const [k, v] of Object.entries(tableMap)) {
     x = x.split(k).join(v);
   }
 
+  // Restore tokens stable form
   x = x
     .replace(/___MATH_TOKEN___(.*?)___END___/g, "[!m:$$$1$$]")
     .replace(/___IMG_TOKEN___(.*?)___END___/g, "[!img:$$$1$$]");
@@ -665,12 +602,17 @@ function wordXmlToTextKeepTokens(docXml) {
 
   return x;
 }
-
 /* ================= SECTION TITLES (PHẦN ...) ================= */
-
+/**
+ * ✅ FIX: lấy ĐẦY ĐỦ tiêu đề PHẦN nhiều dòng/ nhiều đoạn trong Word
+ * - Không chỉ lấy 1 dòng nữa
+ * - Cắt title theo vùng: từ "PHẦN ..." đến ngay trước "Câu X."
+ * - Vẫn giữ mapping questionIndexStart/End như cũ
+ */
 function extractSectionTitles(rawText) {
   const text = String(rawText || "").replace(/\r/g, "");
 
+  // anchors "Câu X."
   const qRe = /(^|\n)\s*Câu\s+(\d+)\./gi;
   const qAnchors = [];
   let qm;
@@ -681,6 +623,7 @@ function extractSectionTitles(rawText) {
     });
   }
 
+  // anchors "PHẦN ..." (chỉ cần bắt vị trí, không ép 1 dòng)
   const sRe =
     /(^|\n)\s*(?:[-•–]\s*)?PHẦN\s+([0-9]+|[IVXLCDM]+)\s*[\.\:\-]?\s*/gi;
 
@@ -697,40 +640,50 @@ function extractSectionTitles(rawText) {
       questionCount: 0,
       questionIndexStart: null,
       questionIndexEnd: null,
-      _phanLabel: sm[2],
+      _phanLabel: sm[2], // debug nếu cần
     });
   }
 
+  // endChar theo section kế tiếp
   for (let i = 0; i < sections.length; i++) {
     sections[i].endChar =
       i + 1 < sections.length ? sections[i + 1].startChar : text.length;
   }
 
+  // normalize tiêu đề nhiều dòng -> 1 dòng gọn (đúng “đủ nội dung”)
   const normalizeTitle = (s) =>
     String(s || "")
       .replace(/\u00A0/g, " ")
       .replace(/[ \t]+\n/g, "\n")
       .replace(/\n{2,}/g, "\n")
       .trim()
+      // nếu muốn GIỮ xuống dòng: đổi " " thành "<br/>"
       .replace(/\s*\n\s*/g, " ")
       .replace(/\s+/g, " ")
       .trim();
 
   for (const sec of sections) {
+    // tìm câu đầu tiên thuộc vùng section
     const startIdx = qAnchors.findIndex(
       (q) => q.idx >= sec.startChar && q.idx < sec.endChar
     );
 
+    // vị trí cắt tiêu đề: trước "Câu ..."
     const firstQIdx = startIdx === -1 ? sec.endChar : qAnchors[startIdx].idx;
 
+    // lấy block title đầy đủ (nhiều dòng)
     let titleBlock = text.slice(sec.startChar, firstQIdx);
+
+    // bỏ khoảng trắng đầu
     titleBlock = titleBlock.replace(/^\s+/g, "");
 
+    // an toàn: nếu titleBlock lỡ chứa "Câu ..." thì cắt luôn
     const cut = titleBlock.search(/(^|\n)\s*Câu\s+\d+\./i);
     if (cut >= 0) titleBlock = titleBlock.slice(0, cut);
 
     sec.title = normalizeTitle(titleBlock);
 
+    // map question ranges giống logic cũ
     if (startIdx === -1) continue;
 
     let endIdx = qAnchors.length;
@@ -741,8 +694,8 @@ function extractSectionTitles(rawText) {
       }
     }
 
-    sec.questionIndexStart = startIdx;
-    sec.questionIndexEnd = endIdx;
+    sec.questionIndexStart = startIdx; // 0-based
+    sec.questionIndexEnd = endIdx; // slice end
     sec.questionCount = endIdx - startIdx;
     sec.firstQuestionNo = qAnchors[startIdx]?.no ?? null;
   }
@@ -1033,7 +986,10 @@ function attachSectionOrderToQuestions(exam, sections) {
 }
 
 /* ================= ✅ FIX UI: BUILD BLOCKS (SECTION + QUESTION) đúng thứ tự ================= */
-
+/**
+ * Nếu frontend render `sections` riêng ở đầu trang => sẽ bị như ảnh của bạn.
+ * => Tạo `blocks` đã TRỘN sẵn để frontend chỉ render theo blocks.
+ */
 function buildOrderedBlocks(exam) {
   const blocks = [];
   let lastSec = null;
@@ -1092,17 +1048,28 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     // sections theo vị trí + index câu toàn cục
     const sections = extractSectionTitles(text);
 
+    // thêm vào exam
     exam.sections = sections;
+
+    // gán sectionOrder/sectionTitle cho từng question
     attachSectionOrderToQuestions(exam, sections);
 
+    // ✅ blocks đã trộn đúng thứ tự để frontend render chuẩn như Word
     const blocks = buildOrderedBlocks(exam);
+
+    // legacy
     const questions = legacyQuestionsFromExam(exam);
 
     res.json({
       ok: true,
       total: exam.questions.length,
+
+      // Nếu vẫn cần, vẫn trả sections (để debug)
       sections,
+
+      // ✅ QUAN TRỌNG: frontend hãy dùng blocks
       blocks,
+
       exam,
       questions,
       latex: latexMap,
