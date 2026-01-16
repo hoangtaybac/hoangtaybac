@@ -1,10 +1,3 @@
-// server.js
-// ✅ FULL CODE (đã sửa phần TIÊU ĐỀ PHẦN trả về đúng thứ tự/vị trí như file gốc)
-// Chạy: node server.js
-// Yêu cầu: inkscape (để convert emf/wmf), ruby + mt2mml.rb (fallback MathType)
-//
-// npm i express multer unzipper cors mathml-to-latex
-
 import express from "express";
 import multer from "multer";
 import unzipper from "unzipper";
@@ -121,20 +114,45 @@ async function maybeConvertEmfWmfToPng(buf, filename) {
 
 /**
  * scan MathML embedded directly in OLE (nhanh)
+ * now tries utf8, utf16le, utf16be
  */
 function extractMathMLFromOleScan(buf) {
-  const utf8 = buf.toString("utf8");
-  let i = utf8.indexOf("<math");
-  if (i !== -1) {
-    let j = utf8.indexOf("</math>", i);
-    if (j !== -1) return utf8.slice(i, j + 7);
-  }
+  const candidates = [];
+  try {
+    candidates.push(buf.toString("utf8"));
+  } catch {}
+  try {
+    candidates.push(buf.toString("utf16le"));
+  } catch {}
+  try {
+    // thử cả utf16be (nhiều OLE dùng BE)
+    const be = Buffer.from(buf);
+    // swap bytes to approximate utf16be if needed
+    for (let i = 0; i + 1 < be.length; i += 2) {
+      const a = be[i];
+      be[i] = be[i + 1];
+      be[i + 1] = a;
+    }
+    candidates.push(be.toString("utf16le"));
+  } catch {}
 
-  const u16 = buf.toString("utf16le");
-  i = u16.indexOf("<math");
-  if (i !== -1) {
-    let j = u16.indexOf("</math>", i);
-    if (j !== -1) return u16.slice(i, j + 7);
+  for (const txt of candidates) {
+    if (!txt) continue;
+    const i = txt.indexOf("<math");
+    if (i !== -1) {
+      const j = txt.indexOf("</math>", i);
+      if (j !== -1) {
+        const slice = txt.slice(i, j + 7);
+        return slice;
+      }
+    }
+    // một số OLE có MathML bị escape (&lt;math ...), thử unescape nhanh
+    const unescaped = txt.replace(/&lt;/g, "<").replace(/&gt;/g, ">");
+    const iu = unescaped.indexOf("<math");
+    if (iu !== -1) {
+      const ju = unescaped.indexOf("</math>", iu);
+      if (ju !== -1) return unescaped.slice(iu, ju + 7);
+    }
   }
 
   return null;
@@ -142,6 +160,7 @@ function extractMathMLFromOleScan(buf) {
 
 /**
  * fallback: call ruby mt2mml.rb ole.bin -> MathML
+ * improved: use absolute script path, increase timeout & buffer, set LANG, run in script dir
  */
 function rubyOleToMathML(oleBuf) {
   return new Promise((resolve, reject) => {
@@ -149,18 +168,30 @@ function rubyOleToMathML(oleBuf) {
     const inPath = path.join(tmpDir, "oleObject.bin");
     fs.writeFileSync(inPath, oleBuf);
 
-    execFile(
-      "ruby",
-      ["mt2mml.rb", inPath],
-      { timeout: 30000, maxBuffer: 20 * 1024 * 1024 },
-      (err, stdout, stderr) => {
-        try {
-          fs.rmSync(tmpDir, { recursive: true, force: true });
-        } catch {}
-        if (err) return reject(new Error(stderr || err.message));
-        resolve(String(stdout || "").trim());
+    // absolute path to script (assumes mt2mml.rb sits next to this file)
+    const scriptPath = path.join(__dirname, "mt2mml.rb");
+
+    const opts = {
+      timeout: 120000, // 2 minutes
+      maxBuffer: 50 * 1024 * 1024, // 50 MB
+      env: Object.assign({}, process.env, { LANG: "en_US.UTF-8" }),
+      cwd: path.dirname(scriptPath),
+    };
+
+    execFile("ruby", [scriptPath, inPath], opts, (err, stdout, stderr) => {
+      try {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      } catch {}
+      if (err) {
+        console.error("[rubyOleToMathML] ruby exec error:", err && err.code, err && err.message);
+        if (stderr) console.error("[rubyOleToMathML] stderr:", String(stderr).slice(0, 4000));
+        if (stdout) console.error("[rubyOleToMathML] stdout:", String(stdout).slice(0, 4000));
+        return reject(new Error(stderr ? String(stderr).trim() : (err && err.message) || "ruby failed"));
       }
-    );
+      const out = String(stdout || "").trim();
+      if (!out) console.warn("[rubyOleToMathML] ruby returned empty stdout");
+      return resolve(out);
+    });
   });
 }
 
@@ -259,6 +290,7 @@ function restoreArrowAndCoreCommands(latex) {
 function fixPiecewiseFunction(latex) {
   let s = String(latex || "");
 
+  // Fix broken parentheses/brackets like "(. " "[. "
   s = s.replace(/\(\.\s+/g, "(");
   s = s.replace(/\s+\.\)/g, ")");
   s = s.replace(/\[\.\s+/g, "[");
@@ -293,6 +325,7 @@ function fixPiecewiseFunction(latex) {
 
     let content = s.slice(contentStart, endIdx).trim();
     content = content.replace(/\s+\.\s*$/, "");
+    // normalize new rows
     content = content.replace(/\s+\\\s+(?=\d)/g, " \\\\ ");
 
     const before = s.slice(0, startIdx);
@@ -304,17 +337,25 @@ function fixPiecewiseFunction(latex) {
 }
 
 /**
- * ✅ XỬ LÝ CĂN (sqrt) “cứng”
+ * ✅ XỬ LÝ CĂN (sqrt) “cứng”:
+ * - Nếu MathML có msqrt/mroot nhưng latex ra ký tự √ hoặc thiếu \sqrt => ép normalize.
+ * - Nếu latex có '√' -> đổi sang \sqrt{...} (heuristic).
  */
 function fixSqrtLatex(latex, mathmlMaybe = "") {
   let s = String(latex || "");
 
-  s = s.replace(/√\s*\(\s*([\s\S]*?)\s*\)/g, "\\sqrt{$1}");
+  // 1) nếu có ký tự căn unicode => đổi dạng \sqrt{...} (đoán theo ngoặc)
+  // √(x+1) => \sqrt{x+1}
+  s = s.replace(/  \s*\(\s*([\s\S]*?)\s*\)/g, "\\sqrt{$1}");
+  // √x => \sqrt{x} (chỉ 1 token đơn)
   s = s.replace(/√\s*([A-Za-z0-9]+)\b/g, "\\sqrt{$1}");
 
+  // 2) nếu MathML có căn mà latex lại không có \sqrt hoặc \root -> thử “đánh dấu”
   if (SQRT_MATHML_RE.test(String(mathmlMaybe || ""))) {
     const hasSqrt = /\\sqrt\b|\\root\b/.test(s);
     if (!hasSqrt && s) {
+      // Một số output lỗi kiểu: "1/(x)"... không suy được; giữ nguyên
+      // nhưng ít nhất loại bỏ ký tự rác "radic" nếu có
       s = s.replace(/\bradic\b/gi, "\\sqrt{}");
     }
   }
@@ -343,7 +384,11 @@ function mathmlToLatexSafe(mml) {
 }
 
 /**
- * MathType FIRST
+ * MathType FIRST:
+ * - token [!m:$mathtype_x$]
+ * - produce:
+ *   latexMap[key] = "..."
+ *   (optional) images["fallback_key"] = png dataURL if latex fails
  */
 async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
   let idx = 0;
@@ -376,53 +421,76 @@ async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
 
   await Promise.all(
     Object.entries(found).map(async ([key, info]) => {
-      const oleFull = normalizeTargetToWordPath(info.oleTarget);
-      const oleBuf = await getZipEntryBuffer(zipFiles, oleFull);
-
-      let mml = "";
-      if (oleBuf) mml = extractMathMLFromOleScan(oleBuf) || "";
-
-      if (!mml && oleBuf) {
-        try {
-          mml = await rubyOleToMathML(oleBuf);
-        } catch {
-          mml = "";
+      try {
+        const oleFull = normalizeTargetToWordPath(info.oleTarget);
+        console.log(`[tokenizeMathType] key=${key} oleTarget=${oleFull} previewRid=${info.previewRid}`);
+        const oleBuf = await getZipEntryBuffer(zipFiles, oleFull);
+        if (!oleBuf) {
+          console.warn(`[tokenizeMathType] no ole buffer for key=${key}`);
+        } else {
+          console.log(`[tokenizeMathType] oleBuf.length=${oleBuf.length} for key=${key}`);
         }
-      }
 
-      const latex = mml ? mathmlToLatexSafe(mml) : "";
-      if (latex) {
-        latexMap[key] = latex;
-        return;
-      }
+        // 1) try scan MathML inside OLE
+        let mml = "";
+        if (oleBuf) {
+          mml = extractMathMLFromOleScan(oleBuf) || "";
+          if (mml) console.log(`[tokenizeMathType] extracted MathML (scan) len=${mml.length} for key=${key}`);
+        }
 
-      if (info.previewRid) {
-        const t = rels.get(info.previewRid);
-        if (t) {
-          const imgFull = normalizeTargetToWordPath(t);
-          const imgBuf = await getZipEntryBuffer(zipFiles, imgFull);
-          if (imgBuf) {
-            const mime = guessMimeFromFilename(imgFull);
-            if (mime === "image/emf" || mime === "image/wmf") {
-              try {
-                const pngBuf = await maybeConvertEmfWmfToPng(imgBuf, imgFull);
-                if (pngBuf) {
-                  images[`fallback_${key}`] = `data:image/png;base64,${pngBuf.toString(
-                    "base64"
-                  )}`;
-                  latexMap[key] = "";
-                  return;
-                }
-              } catch {}
-            }
-            images[`fallback_${key}`] = `data:${mime};base64,${imgBuf.toString(
-              "base64"
-            )}`;
+        // 2) fallback ruby convert (MTEF inside OLE)
+        if (!mml && oleBuf) {
+          try {
+            console.log(`[tokenizeMathType] calling ruby mt2mml for key=${key}`);
+            mml = await rubyOleToMathML(oleBuf);
+            if (mml) console.log(`[tokenizeMathType] ruby produced MathML len=${mml.length} for key=${key}`);
+          } catch (e) {
+            console.warn(`[tokenizeMathType] ruby conversion failed for key=${key}: ${e && e.message}`);
+            mml = "";
           }
         }
-      }
 
-      latexMap[key] = "";
+        // 3) MathML -> LaTeX (✅ có postprocess căn/cases)
+        const latex = mml ? mathmlToLatexSafe(mml) : "";
+        if (latex) {
+          latexMap[key] = latex;
+          return;
+        }
+
+        // 4) If no latex, fallback to preview image (convert emf/wmf->png)
+        if (info.previewRid) {
+          const t = rels.get(info.previewRid);
+          if (t) {
+            const imgFull = normalizeTargetToWordPath(t);
+            const imgBuf = await getZipEntryBuffer(zipFiles, imgFull);
+            if (imgBuf) {
+              const mime = guessMimeFromFilename(imgFull);
+              if (mime === "image/emf" || mime === "image/wmf") {
+                try {
+                  const pngBuf = await maybeConvertEmfWmfToPng(imgBuf, imgFull);
+                  if (pngBuf) {
+                    images[`fallback_${key}`] = `data:image/png;base64,${pngBuf.toString(
+                      "base64"
+                    )}`;
+                    latexMap[key] = "";
+                    console.log(`[tokenizeMathType] fallback image converted emf/wmf -> png for key=${key}`);
+                    return;
+                  }
+                } catch (e) {
+                  console.warn(`[tokenizeMathType] inkscape convert error for key=${key}: ${e && e.message}`);
+                }
+              }
+              images[`fallback_${key}`] = `data:${mime};base64,${imgBuf.toString("base64")}`;
+              console.log(`[tokenizeMathType] using preview image for key=${key} mime=${mime}`);
+            }
+          }
+        }
+
+        latexMap[key] = "";
+      } catch (err) {
+        console.error(`[tokenizeMathType] unexpected error for key=${key}:`, err && err.message);
+        latexMap[key] = "";
+      }
     })
   );
 
@@ -430,7 +498,7 @@ async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
 }
 
 /**
- * Tokenize normal images AFTER MathType
+ * Tokenize normal images AFTER MathType (and convert EMF/WMF -> PNG if possible)
  */
 async function tokenizeImagesAfter(docXml, rels, zipFiles) {
   let idx = 0;
@@ -531,66 +599,7 @@ function wordXmlToTextKeepTokens(docXml) {
   return x;
 }
 
-/* ================= SECTION TITLES (PHẦN ...) ✅ FIX ĐÚNG VỊ TRÍ/THỨ TỰ ================= */
-
-/**
- * ✅ Mục tiêu:
- * - Trả về sections đúng thứ tự như file gốc
- * - Không bị dính "Câu X." nếu PHẦN và Câu nằm cùng 1 dòng
- * - Không dedupe làm mất phần
- * - firstQuestionNo dò cả phần còn lại của dòng hiện tại + các dòng sau
- * ❗ Không đụng vào parseExamFromText
- */
-function extractSectionTitles(rawText) {
-  const s = String(rawText || "").replace(/\r/g, "");
-  const lines = s.split("\n");
-
-  const sections = [];
-
-  // PHẦN 1., PHẦN 2:, PHẦN I., ...
-  const re = /^\s*PHẦN\s+([0-9]+|[IVXLCDM]+)\s*[\.\:\-]?\s*(.*)\s*$/i;
-
-  for (let i = 0; i < lines.length; i++) {
-    const line0 = (lines[i] || "").trim();
-    if (!line0) continue;
-
-    const m = re.exec(line0);
-    if (!m) continue;
-
-    // Nếu cùng dòng có "Câu X." thì cắt title trước "Câu"
-    let title = line0;
-    const cutIdx = title.search(/(?=\bCâu\s+\d+\.)/i);
-    if (cutIdx > 0) title = title.slice(0, cutIdx).trim();
-
-    // Tìm câu đầu tiên: ưu tiên phần còn lại cùng dòng, rồi mới tới các dòng sau
-    let firstQuestionNo = null;
-
-    const restSameLine = cutIdx > 0 ? line0.slice(cutIdx) : "";
-    const qSame = restSameLine.match(/\bCâu\s+(\d+)\./i);
-    if (qSame) firstQuestionNo = Number(qSame[1]);
-
-    if (firstQuestionNo == null) {
-      for (let j = i + 1; j < Math.min(i + 120, lines.length); j++) {
-        const q = (lines[j] || "").match(/^\s*Câu\s+(\d+)\./i);
-        if (q) {
-          firstQuestionNo = Number(q[1]);
-          break;
-        }
-      }
-    }
-
-    sections.push({
-      title,
-      order: sections.length + 1,
-      firstQuestionNo,
-      lineIndex: i,
-    });
-  }
-
-  return sections;
-}
-
-/* ================== EXAM PARSER (GIỮ NGUYÊN) ================== */
+/* ================== EXAM PARSER (BỔ SUNG ĐẦU RA GIỐNG A) ================== */
 
 function stripTagsToPlain(s) {
   return String(s || "")
@@ -641,7 +650,8 @@ function normalizeUnderlinedMarkersForSplit(s) {
 
 function findSolutionMarkerIndex(text, fromIndex = 0) {
   const s = String(text || "");
-  const re = /(Lời\s*giải|Giải\s*chi\s*tiết|Hướng\s*dẫn\s*giải)/i;
+  const re =
+    /(Lời\s*giải|Giải\s*chi\s*tiết|Hướng\s*dẫn\s*giải)/i;
   const sub = s.slice(fromIndex);
   const m = re.exec(sub);
   if (!m) return -1;
@@ -670,12 +680,14 @@ function cleanStemFromQuestionNo(s) {
 
 function splitChoicesTextABCD(blockText) {
   let s = normalizeUnderlinedMarkersForSplit(blockText);
+  // normalize line endings
   s = s.replace(/\r/g, "");
 
   const solIdx = findSolutionMarkerIndex(s, 0);
   const main = solIdx >= 0 ? s.slice(0, solIdx) : s;
   const tail = solIdx >= 0 ? s.slice(solIdx) : "";
 
+  // allow answers on same line
   const re = /(^|\n)\s*(\*?)([A-D])\.\s*/g;
 
   const hits = [];
@@ -737,6 +749,14 @@ function splitStatementsTextabcd(blockText) {
   return out;
 }
 
+/**
+ * ✅ OUTPUT “PHẦN CHO B”: exam.questions kiểu Azota-like:
+ * - mcq: stem + A/B/C/D + answer
+ * - tf4: stem + a/b/c/d + answer object
+ * - short: stem + boxes + solution/detail
+ *
+ * Đồng thời vẫn trả thêm "questions" cũ để bạn không bị vỡ front cũ.
+ */
 function parseExamFromText(text) {
   const blocks = String(text || "").split(/(?=Câu\s+\d+\.)/);
   const exam = { version: 9, questions: [] };
@@ -806,6 +826,7 @@ function parseExamFromText(text) {
       continue;
     }
 
+    // short / tự luận
     const solIdx = findSolutionMarkerIndex(block, 0);
     const stemPart = solIdx >= 0 ? block.slice(0, solIdx).trim() : block.trim();
     const tailPart = solIdx >= 0 ? block.slice(solIdx).trim() : "";
@@ -826,6 +847,9 @@ function parseExamFromText(text) {
   return exam;
 }
 
+/**
+ * questions format cũ (để không vỡ front cũ) — lấy từ exam mcq
+ */
 function legacyQuestionsFromExam(exam) {
   const out = [];
   for (const q of exam.questions) {
@@ -865,37 +889,31 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     const relsXml = (await relEntry.buffer()).toString("utf8");
     const rels = parseRels(relsXml);
 
-    // 1) MathType -> LaTeX (and fallback images)
+    // 1) MathType -> LaTeX (and fallback images) ✅ giữ pipeline B
     const images = {};
     const mt = await tokenizeMathTypeOleFirst(docXml, rels, zip.files, images);
     docXml = mt.outXml;
     const latexMap = mt.latexMap;
 
-    // 2) normal images
+    // 2) normal images ✅ giữ pipeline B
     const imgTok = await tokenizeImagesAfter(docXml, rels, zip.files);
     docXml = imgTok.outXml;
     Object.assign(images, imgTok.imgMap);
 
-    // 3) text (giữ token + underline)
+    // 3) text ✅ giữ token + underline
     const text = wordXmlToTextKeepTokens(docXml);
 
-    // ✅ sections đúng thứ tự/vị trí theo rawText
-    const sections = extractSectionTitles(text);
-
-    // 4) parse exam output (mcq/tf4/short) — GIỮ NGUYÊN
+    // 4) NEW: parse exam output (mcq/tf4/short)
     const exam = parseExamFromText(text);
 
-    // ✅ chỉ thêm field mới, không sửa thuật toán
-    exam.sections = sections;
-
-    // 5) legacy questions output (mcq only)
+    // 5) legacy questions output (mcq only) for backward compatibility
     const questions = legacyQuestionsFromExam(exam);
 
     res.json({
       ok: true,
       total: exam.questions.length,
-      sections,
       exam,
+      // giữ field cũ
       questions,
       latex: latexMap,
       images,
