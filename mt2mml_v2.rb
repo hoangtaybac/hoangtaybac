@@ -12,7 +12,6 @@ rescue NameError
 end
 
 begin
-  # Prefer PLUS
   begin
     require "mathtype_to_mathml_plus"
     mml = try_convert("MathTypeToMathMLPlus", in_path)
