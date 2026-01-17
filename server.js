@@ -4,17 +4,18 @@
 // - Server trả thêm `blocks` đã trộn (section + question) đúng thứ tự để frontend render chuẩn.
 // - ✅ NEW: Giữ được bảng <w:tbl> và nội dung trong bảng (kể cả underline + token math/img)
 //
-// ✅ FIX MẤT CĂN THỨC (MathType OLE):
-// - extract scan bắt cả <math> và <m:math>
-// - normalize MathML: strip prefix m: , menclose radical -> msqrt, entity √
-// - tokenize msqrt bằng <mtext> token an toàn -> rebuild \sqrt{...} (radical-safe)
-// - HARD last resort: MathML có căn mà LaTeX rỗng/không có \sqrt -> bọc \sqrt{...}
+// ✅ FIX ẢNH BỊ THIẾU (Câu 7, Câu 11):
+// - Bắt thêm <a:blip ...> (không tự đóng) ngoài <a:blip .../>
+// - Bắt thêm cả r:link (một số doc dùng link thay vì embed)
 //
-// ✅ FIX ẢNH a:blip:
-// - bắt r:(embed|link)
+// ✅ FIX MẤT CĂN THỨC (MathType OLE):
+// - extractMathMLFromOleScan() bắt cả <math> và <m:math>
+// - normalize MathML: strip prefix m:, menclose radical -> msqrt, mo √ -> msqrt
+// - tokenize msqrt -> token, convert, rebuild \sqrt{...} (radical-safe)
+// - hard wrap nếu MathML có căn mà LaTeX không có \sqrt
 //
 // Chạy: node server.js
-// Yêu cầu: inkscape (convert emf/wmf), ruby + mt2mml_v2.rb (khuyến nghị) / mt2mml.rb
+// Yêu cầu: inkscape (convert emf/wmf), ruby + mt2mml_v2.rb (ưu tiên) / mt2mml.rb (fallback)
 // npm i express multer unzipper cors mathml-to-latex
 
 import express from "express";
@@ -131,11 +132,11 @@ async function maybeConvertEmfWmfToPng(buf, filename) {
 
 /* ================= MathType OLE -> MathML -> LaTeX ================= */
 
-// ✅ Vá extract scan bắt cả <math> và <m:math>
 function extractMathMLFromOleScan(buf) {
   const tryExtract = (s) => {
     if (!s) return null;
 
+    // bắt cả <math ...> và <m:math ...>
     let i = s.indexOf("<math");
     let close = "</math>";
     if (i === -1) {
@@ -144,31 +145,34 @@ function extractMathMLFromOleScan(buf) {
     }
     if (i === -1) return null;
 
-    let j = s.indexOf(close, i);
+    const j = s.indexOf(close, i);
     if (j !== -1) return s.slice(i, j + close.length);
 
+    // fallback: nếu open là <m:math> nhưng close lại </math> (hiếm)
     const j2 = s.indexOf("</math>", i);
     if (j2 !== -1) return s.slice(i, j2 + 7);
 
     return null;
   };
 
+  // utf8
   let out = tryExtract(buf.toString("utf8"));
   if (out) return out;
 
+  // utf16le
   out = tryExtract(buf.toString("utf16le"));
   if (out) return out;
 
   return null;
 }
 
-// ✅ Ruby MTEF (OLE) -> MathML (ưu tiên mt2mml_v2.rb)
 function rubyOleToMathML(oleBuf) {
   return new Promise((resolve, reject) => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ole-"));
     const inPath = path.join(tmpDir, "oleObject.bin");
     fs.writeFileSync(inPath, oleBuf);
 
+    // ✅ Ưu tiên mt2mml_v2.rb nếu có (MTEF→MathML thật), fallback mt2mml.rb
     const script = fs.existsSync("mt2mml_v2.rb") ? "mt2mml_v2.rb" : "mt2mml.rb";
 
     execFile(
@@ -186,25 +190,34 @@ function rubyOleToMathML(oleBuf) {
   });
 }
 
-// ✅ normalize + tokenize msqrt (cứu căn 100%)
+/* ================== LATEX POSTPROCESS ================== */
+
+const SQRT_MATHML_RE = /(msqrt|mroot|√|&#8730;|&#x221a;|&#x221A;|&radic;)/i;
+
+/** ✅ normalize MathML trước khi convert (cứu căn + prefix m:) */
 function normalizeMathMLForConvert(mml) {
   let s = String(mml || "");
 
-  // 1) strip prefix m:
-  s = s.replace(/<(\/?)m:/g, "<$1");
+  // 1) strip prefix m: (mathml-to-latex hay fail nếu giữ m:)
+  s = s.replace(/<\/?m:/g, "<");
+  // strip prefix kiểu khác nếu có (hiếm)
+  s = s.replace(/<\/?[a-zA-Z0-9]+:/g, (tag) =>
+    tag
+      .replace(/^</, "<")
+      .replace(/^<\/?[a-zA-Z0-9]+:/, (x) =>
+        x.replace(/^<\//, "</").replace(/^</, "<")
+      )
+  );
 
-  // 2) strip prefix khác nếu có (hiếm)
-  s = s.replace(/<(\/?)[a-zA-Z0-9]+:/g, "<$1");
-
-  // 3) menclose radical -> msqrt (thủ phạm hay gặp)
+  // 2) menclose radical -> msqrt (thủ phạm “mất căn” phổ biến)
   const reRad =
     /<menclose\b[^>]*\bnotation\s*=\s*"radical"[^>]*>([\s\S]*?)<\/menclose>/gi;
   while (reRad.test(s)) s = s.replace(reRad, "<msqrt>$1</msqrt>");
 
-  // 4) entity √
+  // 3) chuẩn hoá entity √ nếu có
   s = s.replace(/&radic;|&#8730;|&#x221a;|&#x221A;/g, "√");
 
-  // 5) mo √ ... -> msqrt (pattern hay gặp)
+  // 4) mo √ ... -> msqrt (nhiều file gặp dạng này)
   const reMoSqrt =
     /<mo>\s*√\s*<\/mo>\s*(<mrow>[\s\S]*?<\/mrow>|<mi>[\s\S]*?<\/mi>|<mn>[\s\S]*?<\/mn>|<mfenced[\s\S]*?<\/mfenced>)/gi;
   while (reMoSqrt.test(s)) s = s.replace(reMoSqrt, "<msqrt>$1</msqrt>");
@@ -212,16 +225,16 @@ function normalizeMathMLForConvert(mml) {
   return s;
 }
 
-// ✅ tokenize msqrt bằng token "chỉ chữ+số" + bọc <mtext> để converter không bẻ
+/** ✅ token hóa msqrt để converter có drop vẫn rebuild được \sqrt{...} */
 function tokenizeMsqrtBlocks(mathml) {
-  const s0 = String(mathml || "");
+  const s = String(mathml || "");
   const re = /<\/?msqrt\b[^>]*>/gi;
 
   const stack = [];
-  const blocks = [];
+  const blocks = []; // match pairs
 
   let m;
-  while ((m = re.exec(s0)) !== null) {
+  while ((m = re.exec(s)) !== null) {
     const tag = m[0];
     const isClose = tag.startsWith("</");
     if (!isClose) {
@@ -238,32 +251,24 @@ function tokenizeMsqrtBlocks(mathml) {
     }
   }
 
-  if (!blocks.length) return { out: s0, tokens: [] };
+  if (!blocks.length) return { out: s, tokens: [] };
 
-  // replace từ back -> front
+  // replace from back to front to keep indices stable
   blocks.sort((a, b) => b.openStart - a.openStart);
 
-  let out = s0;
+  let out = s;
   const tokens = [];
-  let k = 1;
-
-  for (const b of blocks) {
-    const token = `SQRTTOKEN${k++}X`; // ✅ không underscore
+  for (let i = 0; i < blocks.length; i++) {
+    const b = blocks[i];
+    const token = `SQRTTOKEN${i + 1}X`; // ✅ tránh underscore để ít bị bẻ
     const inner = out.slice(b.openEnd, b.closeStart);
     tokens.push({ token, inner });
 
-    out =
-      out.slice(0, b.openStart) +
-      `<mtext>${token}</mtext>` +
-      out.slice(b.closeEnd);
+    out = out.slice(0, b.openStart) + `<mi>${token}</mi>` + out.slice(b.closeEnd);
   }
 
   return { out, tokens };
 }
-
-/* ================== LATEX POSTPROCESS ================== */
-
-const SQRT_MATHML_RE = /(msqrt|mroot|√|&#8730;|&#x221a;|&#x221A;|&radic;)/i;
 
 function sanitizeLatexStrict(latex) {
   if (!latex) return latex;
@@ -406,7 +411,7 @@ function fixSqrtLatex(latex, mathmlMaybe = "") {
   if (SQRT_MATHML_RE.test(String(mathmlMaybe || ""))) {
     const hasSqrt = /\\sqrt\b|\\root\b/.test(s);
     if (!hasSqrt && s) {
-      s = `\\sqrt{${s}}`;
+      s = s.replace(/\bradic\b/gi, "\\sqrt{}");
     }
   }
 
@@ -423,16 +428,14 @@ function postProcessLatex(latex, mathmlMaybe = "") {
   return String(s || "").replace(/\s+/g, " ").trim();
 }
 
-// ✅ radical-safe MathML -> LaTeX
+/** ✅ Radical-safe: tokenize msqrt -> convert -> rebuild sqrt */
 function mathmlToLatexSafe(mml, _depth = 0) {
   try {
     if (!mml) return "";
     let m = String(mml);
-
-    m = normalizeMathMLForConvert(m);
     if (!m.includes("<math")) return "";
 
-    const hasRadical = SQRT_MATHML_RE.test(m);
+    m = normalizeMathMLForConvert(m);
 
     const tok = tokenizeMsqrtBlocks(m);
     const mTok = tok.out;
@@ -440,51 +443,41 @@ function mathmlToLatexSafe(mml, _depth = 0) {
     let latex0 = (MathMLToLaTeX.convert(mTok) || "").trim();
     latex0 = postProcessLatex(latex0, mTok);
 
-    // hard last resort
-    if (hasRadical && latex0 && !/\\sqrt\b|\\root\b/.test(latex0)) {
-      latex0 = `\\sqrt{${latex0}}`;
+    if (!tok.tokens.length) {
+      // hard wrap nếu MathML có căn mà latex không có sqrt
+      if (SQRT_MATHML_RE.test(m) && latex0 && !/\\sqrt\b|\\root\b/.test(latex0)) {
+        return `\\sqrt{${latex0}}`;
+      }
+      return latex0;
     }
-
-    if (!tok.tokens.length) return latex0;
 
     let out = latex0;
 
     const depth = Number(_depth || 0);
     const canRecurse = depth < 4;
 
-    const esc = (x) => x.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-
     for (const t of tok.tokens) {
-      const innerMath = `<math>${t.inner}</math>`;
       let innerLatex = "";
+      const innerMath = `<math>${t.inner}</math>`;
 
-      if (canRecurse) innerLatex = mathmlToLatexSafe(innerMath, depth + 1);
-      else {
+      if (canRecurse) {
+        innerLatex = mathmlToLatexSafe(innerMath, depth + 1);
+      } else {
         innerLatex = (MathMLToLaTeX.convert(normalizeMathMLForConvert(innerMath)) || "").trim();
         innerLatex = postProcessLatex(innerLatex, innerMath);
       }
 
-      const repl = `\\sqrt{${innerLatex || ""}}`;
-      const base = esc(t.token);
+      innerLatex = innerLatex || "";
+      const repl = `\\sqrt{${innerLatex}}`;
 
-      // token trần
-      out = out.replace(new RegExp(base, "g"), repl);
-
-      // token trong wrapper
-      out = out.replace(
-        new RegExp(String.raw`\\(?:text|mathrm|mathbf|operatorname)\s*\{\s*${base}\s*\}`, "g"),
-        repl
-      );
-
-      // token bị chèn spaces
-      const spaced = t.token.split("").map((ch) => `${esc(ch)}\\s*`).join("");
-      out = out.replace(new RegExp(spaced, "g"), repl);
+      const reTok = new RegExp(t.token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g");
+      out = out.replace(reTok, repl);
     }
 
     out = String(out || "").replace(/\s+/g, " ").trim();
 
-    // hard last resort lần 2
-    if (hasRadical && out && !/\\sqrt\b|\\root\b/.test(out)) {
+    // ✅ HARD FIX cuối: nếu MathML có căn mà latex vẫn không có \sqrt
+    if (SQRT_MATHML_RE.test(m) && out && !/\\sqrt\b|\\root\b/.test(out)) {
       out = `\\sqrt{${out}}`;
     }
 
@@ -510,7 +503,9 @@ async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
     if (!oleTarget) return block;
 
     const vmlRid = block.match(/<v:imagedata\b[^>]*\br:id="([^"]+)"[^>]*\/>/);
+    // ✅ FIX preview: bắt cả r:embed hoặc r:link và tag có thể / > hoặc />
     const blipRid = block.match(/<a:blip\b[^>]*\br:(?:embed|link)="([^"]+)"[^>]*\/?>/);
+
     const previewRid = vmlRid?.[1] || blipRid?.[1] || null;
 
     const key = `mathtype_${++idx}`;
@@ -528,7 +523,6 @@ async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
       let mml = "";
       if (oleBuf) mml = extractMathMLFromOleScan(oleBuf) || "";
 
-      // ✅ nếu scan không có MathML, dùng Ruby MTEF->MathML thật
       if (!mml && oleBuf) {
         try {
           mml = await rubyOleToMathML(oleBuf);
@@ -536,6 +530,9 @@ async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
           mml = "";
         }
       }
+
+      // ✅ normalize trước convert (giúp cả trường hợp m:msqrt)
+      if (mml) mml = normalizeMathMLForConvert(mml);
 
       const latex = mml ? mathmlToLatexSafe(mml) : "";
       if (latex) {
@@ -609,7 +606,7 @@ async function tokenizeImagesAfter(docXml, rels, zipFiles) {
     );
   };
 
-  // ✅ FIX: bắt cả r:embed và r:link (a:blip)
+  // ✅ FIX DUY NHẤT: bắt cả <a:blip .../> và <a:blip ...> + cả r:embed và r:link
   docXml = docXml.replace(
     /<a:blip\b[^>]*\br:(?:embed|link)="([^"]+)"[^>]*\/?>/g,
     (m, rid) => {
@@ -637,7 +634,9 @@ async function tokenizeImagesAfter(docXml, rels, zipFiles) {
 function convertRunsToHtml(fragmentXml) {
   let frag = String(fragmentXml || "");
 
-  frag = frag.replace(/<w:tab\s*\/>/g, "\t").replace(/<w:br\s*\/>/g, "\n");
+  frag = frag
+    .replace(/<w:tab\s*\/>/g, "\t")
+    .replace(/<w:br\s*\/>/g, "\n");
 
   frag = frag.replace(/<w:r\b[\s\S]*?<\/w:r>/g, (run) => {
     const hasU =
@@ -658,6 +657,7 @@ function convertRunsToHtml(fragmentXml) {
 
   frag = frag.replace(/<(?!\/?u\b)[^>]+>/g, "");
   frag = decodeXmlEntities(frag);
+
   frag = frag.replace(/\r/g, "");
   frag = frag.replace(/[ \t]+\n/g, "\n").trim();
   return frag;
@@ -807,6 +807,7 @@ function extractSectionTitles(rawText) {
     );
 
     const firstQIdx = startIdx === -1 ? sec.endChar : qAnchors[startIdx].idx;
+
     let titleBlock = text.slice(sec.startChar, firstQIdx);
     titleBlock = titleBlock.replace(/^\s+/g, "");
 
@@ -1173,11 +1174,15 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     // 4) parse exam output (GIỮ NGUYÊN)
     const exam = parseExamFromText(text);
 
+    // sections theo vị trí + index câu toàn cục
     const sections = extractSectionTitles(text);
+
     exam.sections = sections;
 
     attachSectionOrderToQuestions(exam, sections);
+
     const blocks = buildOrderedBlocks(exam);
+
     const questions = legacyQuestionsFromExam(exam);
 
     res.json({
