@@ -17,6 +17,10 @@
 // ✅ NEW FIX (HỆ PT / ALIGN):
 // - \left[\right. ... \\ ...  =>  \left[ \begin{align} ... \\ ... \end{align} \right.
 //
+// ✅ NEW FIX (CÂU 9 BỊ NHẬN NHẦM TF4):
+// - detectHasTF4 chỉ nhận a) b) c) d) ở ĐẦU DÒNG
+// - chỉ gán type=tf4 nếu splitStatementsTextabcd() tách được thật (parts != null)
+//
 // Chạy: node server.js
 // Yêu cầu: inkscape (convert emf/wmf), ruby + mt2mml_v2.rb (ưu tiên) / mt2mml.rb (fallback)
 // npm i express multer unzipper cors mathml-to-latex
@@ -408,36 +412,24 @@ function fixPiecewiseFunction(latex) {
 /* ================= ✅ NEW: FIX \left[\right. ... \\ ... -> align ================= */
 
 function tightenEquationSpacing(s) {
-  // chỉ dọn nhẹ cho đẹp: 2 x + 5 = 0 -> 2x+5=0 ; 7 x - 5 = 0 -> 7x-5=0
-  // Không đụng vào \commands
   let x = String(s || "");
   x = x.replace(/\s+/g, " ");
-
-  // gom khoảng trắng quanh toán tử cơ bản trong "equation-like"
   x = x.replace(/\s*([=+\-*/])\s*/g, "$1");
-
-  // gom 2 x -> 2x (chỉ khi là số + biến đơn)
   x = x.replace(/\b(\d+)\s+([A-Za-z])\b/g, "$1$2");
-
-  // nhiều biến: x y -> xy (cẩn thận: chỉ ghép khi đều là chữ đơn)
   x = x.replace(/\b([A-Za-z])\s+([A-Za-z])\b/g, "$1$2");
-
   return x.trim();
 }
 
 function fixLeftRightSystemToAlign(latex) {
   let s = String(latex || "").trim();
-
-  // nếu đã là môi trường bảng/align/cases thì không đụng
   if (/\\begin\{(align|aligned|array|cases)\}/.test(s)) return s;
 
-  // match: \left[ \right. <body>
   const re = /\\left\[\s*\\right\.\s*([\s\S]+)$/;
   const m = s.match(re);
   if (!m) return s;
 
   const body = (m[1] || "").trim();
-  if (!/\\\\/.test(body)) return s; // phải có xuống dòng mới coi là hệ
+  if (!/\\\\/.test(body)) return s;
 
   const bodyClean = tightenEquationSpacing(
     body.replace(/\s*\\\\\s*/g, " \\\\ ").replace(/\s+/g, " ").trim()
@@ -468,10 +460,7 @@ function postProcessLatex(latex, mathmlMaybe = "") {
   s = fixSetBracesHard(s);
   s = restoreArrowAndCoreCommands(s);
   s = fixPiecewiseFunction(s);
-
-  // ✅ NEW: hệ dạng \left[\right. ... \\ ...
   s = fixLeftRightSystemToAlign(s);
-
   s = fixSqrtLatex(s, mathmlMaybe);
   return String(s || "").replace(/\s+/g, " ").trim();
 }
@@ -492,7 +481,6 @@ function mathmlToLatexSafe(mml, _depth = 0) {
     latex0 = postProcessLatex(latex0, mTok);
 
     if (!tok.tokens.length) {
-      // hard wrap nếu MathML có căn mà latex không có sqrt
       if (SQRT_MATHML_RE.test(m) && latex0 && !/\\sqrt\b|\\root\b/.test(latex0)) {
         return `\\sqrt{${latex0}}`;
       }
@@ -524,7 +512,6 @@ function mathmlToLatexSafe(mml, _depth = 0) {
 
     out = String(out || "").replace(/\s+/g, " ").trim();
 
-    // ✅ HARD FIX cuối: nếu MathML có căn mà latex vẫn không có \sqrt
     if (SQRT_MATHML_RE.test(m) && out && !/\\sqrt\b|\\root\b/.test(out)) {
       out = `\\sqrt{${out}}`;
     }
@@ -551,7 +538,6 @@ async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
     if (!oleTarget) return block;
 
     const vmlRid = block.match(/<v:imagedata\b[^>]*\br:id="([^"]+)"[^>]*\/>/);
-    // ✅ FIX preview: bắt cả r:embed hoặc r:link và tag có thể / > hoặc />
     const blipRid = block.match(/<a:blip\b[^>]*\br:(?:embed|link)="([^"]+)"[^>]*\/?>/);
 
     const previewRid = vmlRid?.[1] || blipRid?.[1] || null;
@@ -579,7 +565,6 @@ async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
         }
       }
 
-      // ✅ normalize trước convert (giúp cả trường hợp m:msqrt)
       if (mml) mml = normalizeMathMLForConvert(mml);
 
       const latex = mml ? mathmlToLatexSafe(mml) : "";
@@ -588,7 +573,6 @@ async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
         return;
       }
 
-      // fallback preview image
       if (info.previewRid) {
         const t = rels.get(info.previewRid);
         if (t) {
@@ -600,17 +584,13 @@ async function tokenizeMathTypeOleFirst(docXml, rels, zipFiles, images) {
               try {
                 const pngBuf = await maybeConvertEmfWmfToPng(imgBuf, imgFull);
                 if (pngBuf) {
-                  images[`fallback_${key}`] = `data:image/png;base64,${pngBuf.toString(
-                    "base64"
-                  )}`;
+                  images[`fallback_${key}`] = `data:image/png;base64,${pngBuf.toString("base64")}`;
                   latexMap[key] = "";
                   return;
                 }
               } catch {}
             }
-            images[`fallback_${key}`] = `data:${mime};base64,${imgBuf.toString(
-              "base64"
-            )}`;
+            images[`fallback_${key}`] = `data:${mime};base64,${imgBuf.toString("base64")}`;
           }
         }
       }
@@ -654,7 +634,6 @@ async function tokenizeImagesAfter(docXml, rels, zipFiles) {
     );
   };
 
-  // ✅ FIX DUY NHẤT: bắt cả <a:blip .../> và <a:blip ...> + cả r:embed và r:link
   docXml = docXml.replace(
     /<a:blip\b[^>]*\br:(?:embed|link)="([^"]+)"[^>]*\/?>/g,
     (m, rid) => {
@@ -682,21 +661,15 @@ async function tokenizeImagesAfter(docXml, rels, zipFiles) {
 function convertRunsToHtml(fragmentXml) {
   let frag = String(fragmentXml || "");
 
-  frag = frag
-    .replace(/<w:tab\s*\/>/g, "\t")
-    .replace(/<w:br\s*\/>/g, "\n");
+  frag = frag.replace(/<w:tab\s*\/>/g, "\t").replace(/<w:br\s*\/>/g, "\n");
 
   frag = frag.replace(/<w:r\b[\s\S]*?<\/w:r>/g, (run) => {
     const hasU =
-      /<w:u\b[^>]*\/>/.test(run) &&
-      !/<w:u\b[^>]*w:val="none"[^>]*\/>/.test(run);
+      /<w:u\b[^>]*\/>/.test(run) && !/<w:u\b[^>]*w:val="none"[^>]*\/>/.test(run);
 
     let inner = run.replace(/<w:rPr\b[\s\S]*?<\/w:rPr>/g, "");
     inner = inner.replace(/<w:t\b[^>]*>([\s\S]*?)<\/w:t>/g, (_, t) => t ?? "");
-    inner = inner.replace(
-      /<w:instrText\b[^>]*>([\s\S]*?)<\/w:instrText>/g,
-      (_, t) => t ?? ""
-    );
+    inner = inner.replace(/<w:instrText\b[^>]*>([\s\S]*?)<\/w:instrText>/g, (_, t) => t ?? "");
 
     inner = inner.replace(/<[^>]+>/g, "");
     if (!inner) return "";
@@ -765,15 +738,11 @@ function wordXmlToTextKeepTokens(docXml) {
 
   x = x.replace(/<w:r\b[\s\S]*?<\/w:r>/g, (run) => {
     const hasU =
-      /<w:u\b[^>]*\/>/.test(run) &&
-      !/<w:u\b[^>]*w:val="none"[^>]*\/>/.test(run);
+      /<w:u\b[^>]*\/>/.test(run) && !/<w:u\b[^>]*w:val="none"[^>]*\/>/.test(run);
 
     let inner = run.replace(/<w:rPr\b[\s\S]*?<\/w:rPr>/g, "");
     inner = inner.replace(/<w:t\b[^>]*>([\s\S]*?)<\/w:t>/g, (_, t) => t ?? "");
-    inner = inner.replace(
-      /<w:instrText\b[^>]*>([\s\S]*?)<\/w:instrText>/g,
-      (_, t) => t ?? ""
-    );
+    inner = inner.replace(/<w:instrText\b[^>]*>([\s\S]*?)<\/w:instrText>/g, (_, t) => t ?? "");
 
     inner = inner.replace(/<[^>]+>/g, "");
     if (!inner) return "";
@@ -835,8 +804,7 @@ function extractSectionTitles(rawText) {
   }
 
   for (let i = 0; i < sections.length; i++) {
-    sections[i].endChar =
-      i + 1 < sections.length ? sections[i + 1].startChar : text.length;
+    sections[i].endChar = i + 1 < sections.length ? sections[i + 1].startChar : text.length;
   }
 
   const normalizeTitle = (s) =>
@@ -850,10 +818,7 @@ function extractSectionTitles(rawText) {
       .trim();
 
   for (const sec of sections) {
-    const startIdx = qAnchors.findIndex(
-      (q) => q.idx >= sec.startChar && q.idx < sec.endChar
-    );
-
+    const startIdx = qAnchors.findIndex((q) => q.idx >= sec.startChar && q.idx < sec.endChar);
     const firstQIdx = startIdx === -1 ? sec.endChar : qAnchors[startIdx].idx;
 
     let titleBlock = text.slice(sec.startChar, firstQIdx);
@@ -883,7 +848,7 @@ function extractSectionTitles(rawText) {
   return sections;
 }
 
-/* ================== EXAM PARSER (GIỮ NGUYÊN) ================== */
+/* ================== EXAM PARSER (GIỮ NGUYÊN + ✅ FIX TF4) ================== */
 
 function stripTagsToPlain(s) {
   return String(s || "")
@@ -898,9 +863,10 @@ function detectHasMCQ(plain) {
   return new Set(marks).size >= 2;
 }
 
+// ✅ FIX: chỉ nhận a) b) c) d) nếu ở ĐẦU DÒNG (tránh dính "a), b), c), d)" trong tiêu đề PHẦN)
 function detectHasTF4(plain) {
-  const marks = plain.match(/\b[a-d]\)/gi) || [];
-  return new Set(marks.map((x) => x.toLowerCase())).size >= 2;
+  const marks = plain.match(/(^|\n)\s*[a-d]\)\s*/gi) || [];
+  return new Set(marks.map((x) => x.trim().toLowerCase()[0])).size >= 2;
 }
 
 function extractUnderlinedKeys(blockText) {
@@ -1071,32 +1037,37 @@ function parseExamFromText(text) {
       continue;
     }
 
+    // ✅ FIX: chỉ coi là tf4 nếu splitStatementsTextabcd() tách được thật (parts != null)
     if (isTF4) {
       const parts = splitStatementsTextabcd(block);
-      const tail = parts?.tail || "";
-      const solParts = splitSolutionSections(tail);
 
-      const ans = { a: null, b: null, c: null, d: null };
-      for (const k of ["a", "b", "c", "d"]) {
-        if (under.tf.includes(k)) ans[k] = true;
+      if (parts) {
+        const tail = parts?.tail || "";
+        const solParts = splitSolutionSections(tail);
+
+        const ans = { a: null, b: null, c: null, d: null };
+        for (const k of ["a", "b", "c", "d"]) {
+          if (under.tf.includes(k)) ans[k] = true;
+        }
+
+        exam.questions.push({
+          no,
+          type: "tf4",
+          stem: cleanStemFromQuestionNo(parts?.stem || block),
+          statements: {
+            a: parts?.statements?.a || "",
+            b: parts?.statements?.b || "",
+            c: parts?.statements?.c || "",
+            d: parts?.statements?.d || "",
+          },
+          answer: ans,
+          solution: solParts.solution || "",
+          detail: solParts.detail || "",
+          _plain: plain,
+        });
+        continue;
       }
-
-      exam.questions.push({
-        no,
-        type: "tf4",
-        stem: cleanStemFromQuestionNo(parts?.stem || block),
-        statements: {
-          a: parts?.statements?.a || "",
-          b: parts?.statements?.b || "",
-          c: parts?.statements?.c || "",
-          d: parts?.statements?.d || "",
-        },
-        answer: ans,
-        solution: solParts.solution || "",
-        detail: solParts.detail || "",
-        _plain: plain,
-      });
-      continue;
+      // nếu parts = null => rơi xuống nhánh short
     }
 
     const solIdx = findSolutionMarkerIndex(block, 0);
@@ -1150,10 +1121,7 @@ function attachSectionOrderToQuestions(exam, sections) {
   }
 
   for (const sec of sections) {
-    if (
-      typeof sec.questionIndexStart !== "number" ||
-      typeof sec.questionIndexEnd !== "number"
-    ) {
+    if (typeof sec.questionIndexStart !== "number" || typeof sec.questionIndexEnd !== "number") {
       continue;
     }
     const a = Math.max(0, sec.questionIndexStart);
@@ -1195,11 +1163,8 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     const zip = await unzipper.Open.buffer(req.file.buffer);
 
     const docEntry = zip.files.find((f) => f.path === "word/document.xml");
-    const relEntry = zip.files.find(
-      (f) => f.path === "word/_rels/document.xml.rels"
-    );
-    if (!docEntry || !relEntry)
-      throw new Error("Missing document.xml or document.xml.rels");
+    const relEntry = zip.files.find((f) => f.path === "word/_rels/document.xml.rels");
+    if (!docEntry || !relEntry) throw new Error("Missing document.xml or document.xml.rels");
 
     let docXml = (await docEntry.buffer()).toString("utf8");
     const relsXml = (await relEntry.buffer()).toString("utf8");
@@ -1224,13 +1189,11 @@ app.post("/upload", upload.single("file"), async (req, res) => {
 
     // sections theo vị trí + index câu toàn cục
     const sections = extractSectionTitles(text);
-
     exam.sections = sections;
 
     attachSectionOrderToQuestions(exam, sections);
 
     const blocks = buildOrderedBlocks(exam);
-
     const questions = legacyQuestionsFromExam(exam);
 
     res.json({
