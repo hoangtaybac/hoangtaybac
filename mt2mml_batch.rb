@@ -1,7 +1,9 @@
-# mt2mml_v2.rb - Custom converter with proper XML parsing for tmROOT
+# mt2mml_batch.rb - Batch converter for multiple OLE files
+# Usage: ruby mt2mml_batch.rb file1.bin file2.bin file3.bin ...
+# Output: JSON array of results
+
 require 'json'
 
-# Load required gems with error handling
 begin
   require 'mathtype'
 rescue LoadError => e
@@ -22,27 +24,9 @@ rescue LoadError => e
   STDERR.puts "Warning: rexml not found: #{e.message}"
 end
 
-path = ARGV[0]
-unless path && File.exist?(path)
-  puts JSON.generate({ error: "File not found: #{path}" })
-  exit 1
-end
-
-result = {
-  mtef_xml: nil,
-  mathml: nil,
-  has_sqrt_mtef: false,
-  has_sqrt_mathml: false,
-  sqrt_selectors: [],
-  sqrt_fixed: false,
-  fix_method: nil,
-  error: nil
-}
-
 # ============================================================
-# Custom MTEF XML to MathML converter using REXML
+# Custom MTEF XML to MathML converter (same as mt2mml_v2.rb)
 # ============================================================
-
 class MtefToMathml
   def initialize(mtef_xml)
     @doc = REXML::Document.new(mtef_xml)
@@ -94,7 +78,6 @@ class MtefToMathml
     
     code = mt_code.strip.start_with?('0x') ? mt_code.strip.to_i(16) : mt_code.strip.to_i
     
-    # Skip problematic characters
     return "" if code < 0x0020
     return "" if code == 0x007F
     return " " if code == 0x00A0
@@ -204,86 +187,79 @@ class MtefToMathml
 end
 
 # ============================================================
-# Main conversion logic
+# Convert single file
 # ============================================================
+def convert_single(path)
+  result = {
+    path: path,
+    mathml: nil,
+    error: nil
+  }
 
-begin
-  # Step 1: Get MTEF XML
-  mtef_converter = Mathtype::Converter.new(path)
-  result[:mtef_xml] = mtef_converter.to_xml
-  mtef_xml = result[:mtef_xml] || ""
-  
-  # Check for sqrt in MTEF XML
-  result[:has_sqrt_mtef] = true if mtef_xml =~ /<selector>\s*tmROOT\s*<\/selector>/i
-  
-  # Capture all selector values
-  mtef_xml.scan(/<selector>([^<]+)<\/selector>/i).each do |match|
-    selector = match[0].strip
-    result[:sqrt_selectors] << selector unless result[:sqrt_selectors].include?(selector)
+  unless File.exist?(path)
+    result[:error] = "File not found"
+    return result
   end
-  
-  # Step 2: Choose converter
-  mathml = ""
-  
-  if result[:has_sqrt_mtef]
-    # Formula HAS sqrt - use custom converter (gem is broken for tmROOT)
-    begin
-      custom_converter = MtefToMathml.new(mtef_xml)
-      mathml = custom_converter.convert || ""
-      
-      if mathml =~ /<msqrt|<mroot/i
-        result[:sqrt_fixed] = true
-        result[:fix_method] = "custom_mtef_converter"
-      elsif GEM_AVAILABLE
-        converter = MathTypeToMathML::Converter.new(path)
-        mathml = converter.convert || ""
-        result[:fix_method] = "gem_fallback_for_sqrt"
-      end
-    rescue => e
-      STDERR.puts "Custom converter error: #{e.message}"
-      if GEM_AVAILABLE
-        converter = MathTypeToMathML::Converter.new(path)
-        mathml = converter.convert || ""
-        result[:fix_method] = "gem_fallback_error"
-      end
-    end
-  else
-    # Formula has NO sqrt - use gem (works fine)
-    if GEM_AVAILABLE
-      begin
-        converter = MathTypeToMathML::Converter.new(path)
-        mathml = converter.convert || ""
-        result[:fix_method] = "gem"
-      rescue => e
-        STDERR.puts "Gem error: #{e.message}"
-        # Fallback to custom
-        begin
-          custom_converter = MtefToMathml.new(mtef_xml)
-          mathml = custom_converter.convert || ""
-          result[:fix_method] = "custom_fallback"
-        rescue => e2
-          STDERR.puts "Both converters failed: #{e2.message}"
-        end
-      end
-    else
-      # No gem, use custom
+
+  begin
+    # Get MTEF XML
+    mtef_converter = Mathtype::Converter.new(path)
+    mtef_xml = mtef_converter.to_xml
+    
+    has_sqrt = mtef_xml =~ /<selector>\s*tmROOT\s*<\/selector>/i
+    
+    mathml = ""
+    
+    if has_sqrt
+      # Use custom converter for sqrt
       begin
         custom_converter = MtefToMathml.new(mtef_xml)
         mathml = custom_converter.convert || ""
-        result[:fix_method] = "custom_only"
+        
+        if mathml.empty? || !(mathml =~ /<msqrt|<mroot/i)
+          if GEM_AVAILABLE
+            converter = MathTypeToMathML::Converter.new(path)
+            mathml = converter.convert || ""
+          end
+        end
       rescue => e
-        STDERR.puts "Custom converter error: #{e.message}"
+        if GEM_AVAILABLE
+          converter = MathTypeToMathML::Converter.new(path)
+          mathml = converter.convert || ""
+        end
+      end
+    else
+      # Use gem for non-sqrt
+      if GEM_AVAILABLE
+        converter = MathTypeToMathML::Converter.new(path)
+        mathml = converter.convert || ""
+      else
+        custom_converter = MtefToMathml.new(mtef_xml)
+        mathml = custom_converter.convert || ""
       end
     end
-  end
-  
-  result[:mathml] = mathml
-  result[:has_sqrt_mathml] = (mathml =~ /<msqrt|<mroot/i) ? true : false
+    
+    result[:mathml] = mathml
 
-rescue => e
-  result[:error] = "#{e.class}: #{e.message}"
-  STDERR.puts "Main error: #{e.class}: #{e.message}"
-  STDERR.puts e.backtrace.first(5).join("\n")
+  rescue => e
+    result[:error] = "#{e.class}: #{e.message}"
+  end
+
+  result
 end
 
-puts JSON.generate(result)
+# ============================================================
+# Main: Process all files in batch
+# ============================================================
+if ARGV.empty?
+  puts JSON.generate({ error: "No files provided" })
+  exit 1
+end
+
+results = []
+
+ARGV.each do |path|
+  results << convert_single(path)
+end
+
+puts JSON.generate(results)
