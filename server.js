@@ -14,6 +14,9 @@
 // - tokenize msqrt -> token, convert, rebuild \sqrt{...} (radical-safe)
 // - hard wrap nếu MathML có căn mà LaTeX không có \sqrt
 //
+// ✅ NEW FIX (HỆ PT / ALIGN):
+// - \left[\right. ... \\ ...  =>  \left[ \begin{align} ... \\ ... \end{align} \right.
+//
 // Chạy: node server.js
 // Yêu cầu: inkscape (convert emf/wmf), ruby + mt2mml_v2.rb (ưu tiên) / mt2mml.rb (fallback)
 // npm i express multer unzipper cors mathml-to-latex
@@ -402,6 +405,47 @@ function fixPiecewiseFunction(latex) {
   return s;
 }
 
+/* ================= ✅ NEW: FIX \left[\right. ... \\ ... -> align ================= */
+
+function tightenEquationSpacing(s) {
+  // chỉ dọn nhẹ cho đẹp: 2 x + 5 = 0 -> 2x+5=0 ; 7 x - 5 = 0 -> 7x-5=0
+  // Không đụng vào \commands
+  let x = String(s || "");
+  x = x.replace(/\s+/g, " ");
+
+  // gom khoảng trắng quanh toán tử cơ bản trong "equation-like"
+  x = x.replace(/\s*([=+\-*/])\s*/g, "$1");
+
+  // gom 2 x -> 2x (chỉ khi là số + biến đơn)
+  x = x.replace(/\b(\d+)\s+([A-Za-z])\b/g, "$1$2");
+
+  // nhiều biến: x y -> xy (cẩn thận: chỉ ghép khi đều là chữ đơn)
+  x = x.replace(/\b([A-Za-z])\s+([A-Za-z])\b/g, "$1$2");
+
+  return x.trim();
+}
+
+function fixLeftRightSystemToAlign(latex) {
+  let s = String(latex || "").trim();
+
+  // nếu đã là môi trường bảng/align/cases thì không đụng
+  if (/\\begin\{(align|aligned|array|cases)\}/.test(s)) return s;
+
+  // match: \left[ \right. <body>
+  const re = /\\left\[\s*\\right\.\s*([\s\S]+)$/;
+  const m = s.match(re);
+  if (!m) return s;
+
+  const body = (m[1] || "").trim();
+  if (!/\\\\/.test(body)) return s; // phải có xuống dòng mới coi là hệ
+
+  const bodyClean = tightenEquationSpacing(
+    body.replace(/\s*\\\\\s*/g, " \\\\ ").replace(/\s+/g, " ").trim()
+  );
+
+  return `\\left[ \\begin{align} ${bodyClean} \\end{align} \\right.`;
+}
+
 function fixSqrtLatex(latex, mathmlMaybe = "") {
   let s = String(latex || "");
 
@@ -424,6 +468,10 @@ function postProcessLatex(latex, mathmlMaybe = "") {
   s = fixSetBracesHard(s);
   s = restoreArrowAndCoreCommands(s);
   s = fixPiecewiseFunction(s);
+
+  // ✅ NEW: hệ dạng \left[\right. ... \\ ...
+  s = fixLeftRightSystemToAlign(s);
+
   s = fixSqrtLatex(s, mathmlMaybe);
   return String(s || "").replace(/\s+/g, " ").trim();
 }
